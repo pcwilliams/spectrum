@@ -88,4 +88,4 @@ xcodebuild -project Spectrum.xcodeproj -scheme Spectrum \
 
 ## Documentation
 
-See [Architecture](https://pcwilliams.design/dev/spectrum/https://pcwilliams.design/dev/spectrum/architecture.html) for interactive diagrams, [Tutorial](https://pcwilliams.design/dev/spectrum/https://pcwilliams.design/dev/spectrum/tutorial.html) for the build narrative, and [CLAUDE.md](CLAUDE.md) for the full developer reference.
+See [Architecture](https://pcwilliams.design/dev/spectrum/architecture.html) for interactive diagrams, [Tutorial](https://pcwilliams.design/dev/spectrum/tutorial.html) for the build narrative, and [CLAUDE.md](CLAUDE.md) for the full developer reference.

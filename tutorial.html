@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spectrum - Build Tutorial</title>
+    <style>
+        :root {
+            --bg: #0a0a14;
+            --surface: #12121f;
+            --border: #1e1e3a;
+            --text: #e0e0f0;
+            --accent: #00d4ff;
+            --prompt-bg: #0d1a2a;
+            --response-bg: #1a0d2a;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro', system-ui, sans-serif;
+            padding: 2rem;
+            line-height: 1.7;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(90deg, #0066ff, #00ccff, #00ff88, #ffcc00, #ff4400);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .subtitle {
+            text-align: center;
+            color: #888;
+            margin-bottom: 2rem;
+            font-size: 0.9rem;
+        }
+        .step {
+            margin-bottom: 2rem;
+        }
+        .step-number {
+            display: inline-block;
+            background: linear-gradient(135deg, #0066ff, #00ccff);
+            color: white;
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            text-align: center;
+            line-height: 32px;
+            font-weight: bold;
+            font-size: 0.9rem;
+            margin-right: 0.5rem;
+        }
+        .step-title {
+            display: inline;
+            font-size: 1.2rem;
+            color: var(--accent);
+        }
+        .prompt {
+            background: var(--prompt-bg);
+            border-left: 3px solid #0066ff;
+            border-radius: 0 8px 8px 0;
+            padding: 1rem 1.25rem;
+            margin: 1rem 0;
+            font-style: italic;
+        }
+        .prompt::before {
+            content: "Prompt: ";
+            font-weight: bold;
+            font-style: normal;
+            color: #4488ff;
+        }
+        .response {
+            background: var(--response-bg);
+            border-left: 3px solid #8844ff;
+            border-radius: 0 8px 8px 0;
+            padding: 1rem 1.25rem;
+            margin: 1rem 0;
+        }
+        .response::before {
+            content: "Approach: ";
+            font-weight: bold;
+            color: #aa66ff;
+        }
+        .outcome {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem 1.25rem;
+            margin: 1rem 0;
+        }
+        .outcome::before {
+            content: "Outcome: ";
+            font-weight: bold;
+            color: #00cc88;
+        }
+        .tech-note {
+            background: #1a1a0d;
+            border-left: 3px solid #ccaa00;
+            border-radius: 0 8px 8px 0;
+            padding: 0.75rem 1rem;
+            margin: 0.75rem 0;
+            font-size: 0.9rem;
+        }
+        .tech-note::before {
+            content: "Technical note: ";
+            font-weight: bold;
+            color: #ccaa00;
+        }
+    </style>
+</head>
+<body>
+    <h1>Spectrum</h1>
+    <p class="subtitle">Build Tutorial — A conversation-driven development narrative</p>
+
+    <!-- Hero screenshot -->
+    <div style="text-align: center; margin: 32px 0 40px;">
+        <div style="display: inline-block; background: #000; border-radius: 40px; padding: 14px; box-shadow: 0 16px 64px rgba(0,0,0,0.6);">
+            <img src="spectrum.png" alt="Spectrum running on iPhone 16 Pro" style="width: 260px; border-radius: 28px; display: block;" />
+        </div>
+        <p style="color: #888; font-size: 0.85rem; margin-top: 16px;">The finished app running on iPhone 16 Pro — built entirely through conversation</p>
+    </div>
+
+    <div class="step">
+        <span class="step-number">1</span>
+        <h2 class="step-title">The Initial Vision</h2>
+
+        <div class="prompt">
+            I'd love to build a real-time audio spectrum analyser that shows a beautiful real-time display on my phone of the live frequency breakdown of incoming audio. Could we utilise the GPU for graphics, and would it be worth using it for the audio analysis too — presumably a fast Fourier transform?
+        </div>
+
+        <div class="response">
+            The key architectural decision was made upfront: use the GPU (Metal) for rendering but the CPU (Accelerate/vDSP) for FFT analysis. Apple's vDSP is heavily SIMD-optimised and processes a 2048-sample FFT in microseconds. Running FFT on the GPU via Metal compute shaders would add complexity with data-transfer overhead that negates any speed benefit at these buffer sizes. The GPU's strength is rendering thousands of coloured triangles per frame — exactly what we need for the visualisation.
+        </div>
+
+        <div class="tech-note">
+            The decision to use vDSP over Metal compute is buffer-size dependent. For audio (1K–4K samples), CPU wins. For large-scale signal processing (millions of samples), GPU compute would be worth the transfer overhead.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">2</span>
+        <h2 class="step-title">Clarifying the Design</h2>
+
+        <div class="prompt">
+            Multiple visualisation modes please. Gradient colours (cool to hot). Logarithmic frequency scale. Peak indicators, dB scale, frequency labels, waveform view beneath. Let's call it Spectrum.
+        </div>
+
+        <div class="response">
+            With clear requirements established, the full architecture was planned: four modes (Bars, Curve, Circular, Spectrogram), all rendered through a single Metal pipeline using coloured triangles. The audio engine would capture via AVAudioEngine, process with vDSP, and publish normalised data that the renderer reads each frame.
+        </div>
+
+        <div class="outcome">
+            Complete project scaffolded in one pass: 7 Swift source files, 1 Metal shader file, Xcode project, and all documentation. The build succeeded on the first attempt — a testament to careful upfront planning of the pbxproj structure and Metal pipeline configuration.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">3</span>
+        <h2 class="step-title">The Audio Pipeline</h2>
+
+        <div class="response">
+            The FFT pipeline was built using Accelerate's C-level vDSP functions rather than the newer Swift overlay, giving precise control over the processing chain:
+            <br><br>
+            <strong>Hanning window</strong> → reduces spectral leakage at buffer boundaries<br>
+            <strong>vDSP_ctoz</strong> → packs real audio data into split-complex format<br>
+            <strong>vDSP_fft_zrip</strong> → performs the real-to-complex FFT in-place<br>
+            <strong>vDSP_zvmags</strong> → computes squared magnitudes (power spectrum)<br>
+            <strong>vDSP_vdbcon</strong> → converts power to decibels
+        </div>
+
+        <div class="tech-note">
+            The logarithmic band mapping is critical for musical perception. Linear mapping would dedicate half the display to frequencies above 10kHz (one octave), while log mapping gives equal visual weight to each octave: 20–40Hz, 40–80Hz, ..., 10k–20kHz. This matches how we actually hear pitch.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">4</span>
+        <h2 class="step-title">Metal Rendering Architecture</h2>
+
+        <div class="response">
+            Rather than using separate Metal pipelines for each visualisation mode, all four modes share a single vertex/fragment shader pair. The CPU builds coloured vertex data (position + RGBA) each frame, uploads it to a pre-allocated 200K-vertex Metal buffer, and issues a single draw call. This keeps the shader code trivial while giving full flexibility on the CPU side.
+            <br><br>
+            The spectrogram mode was initially considered with a Metal texture approach, but the vertex-based approach (128×128 coloured quads = ~98K vertices) proved simpler and well within performance budgets.
+        </div>
+
+        <div class="tech-note">
+            The gradient colour scheme maps frequency position (0–1) through a five-stop ramp: blue → cyan → green → yellow → red. This provides good perceptual contrast across the spectrum. The spectrogram uses a separate heatmap that starts from black for silence, making quiet regions visually distinct.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">5</span>
+        <h2 class="step-title">The Metal Alignment Bug</h2>
+
+        <div class="prompt">
+            The graphics seem broken. Are you able to test in the simulator? Also once you choose Spectrogram the app freezes.
+        </div>
+
+        <div class="response">
+            The root cause was a struct alignment mismatch between Metal and Swift. The Metal shader used <code>packed_float2</code> + <code>packed_float4</code> (24 bytes per vertex, no padding), but Swift's <code>SIMD4&lt;Float&gt;</code> requires 16-byte alignment, making <code>SpectrumVertex</code> 32 bytes (with 8 bytes of padding between position and colour). Every vertex after the first was read from the wrong offset, causing garbled positions and colours.
+            <br><br>
+            In Spectrogram mode, the ~98K triangles with garbled positions created degenerate geometry covering the entire screen many times over, overwhelming the GPU with fragment shader work — causing the freeze.
+        </div>
+
+        <div class="outcome">
+            Changed the Metal shader to use non-packed <code>float2</code>/<code>float4</code> types, matching Swift's 32-byte stride. Also added <code>reserveCapacity</code> for the vertex array and throttled spectrogram history updates to ~20fps. All four modes now render correctly with no freezing.
+        </div>
+
+        <div class="tech-note">
+            This is a common Metal/Swift pitfall. Metal's <code>packed_float4</code> has 4-byte alignment (24-byte struct), while Swift's <code>SIMD4&lt;Float&gt;</code> has 16-byte alignment (32-byte struct). Always verify that Metal struct layouts match Swift struct layouts — <code>MemoryLayout&lt;T&gt;.stride</code> is the key value to check.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">6</span>
+        <h2 class="step-title">Simulator Testing with Launch Arguments</h2>
+
+        <div class="prompt">
+            You don't need to guess where the UI buttons are — you can add command line args to set the mode of operation when testing! This is how we eventually got the ShiftingSands simulation working, if you remember?
+        </div>
+
+        <div class="response">
+            Rather than trying to tap simulator UI from the command line (which is unreliable), the app was given launch argument support. <code>ProcessInfo.processInfo.arguments</code> is parsed in ContentView to accept <code>-mode bars|curve|circular|spectrogram</code>. This enables fully automated visual testing: install, launch with a specific mode, screenshot, verify — all from the command line.
+        </div>
+
+        <div class="outcome">
+            All four modes were tested automatically in the simulator, confirming correct rendering after the alignment fix. The pattern was documented in the top-level CLAUDE.md as a standard approach for all future projects with multiple visual states.
+        </div>
+
+        <div class="tech-note">
+            The testing workflow: <code>xcrun simctl terminate</code> → <code>xcrun simctl launch ... -- -mode X</code> → <code>sleep 2</code> → <code>xcrun simctl io screenshot</code>. Grant permissions upfront with <code>xcrun simctl privacy ... grant microphone</code> to avoid dialogs.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">7</span>
+        <h2 class="step-title">Comprehensive Test Suite</h2>
+
+        <div class="prompt">
+            Don't forget to write comprehensive tests!
+        </div>
+
+        <div class="response">
+            Pure decision logic was extracted from AudioEngine and MetalRenderer into <code>internal static</code> methods that can be tested without audio hardware or a Metal GPU. This included logarithmic band mapping, exponential smoothing, peak tracking, gradient colour calculation, and heatmap colour mapping. The test target uses Xcode 16's <code>PBXFileSystemSynchronizedRootGroup</code> for automatic test file discovery.
+        </div>
+
+        <div class="outcome">
+            46 tests across three suites (AudioEngineTests, MetalRendererTests, SpectrumDataTests) covering boundary values, clamping, interpolation, colour stops, layout constraints, coordinate conversion, and custom dB range parameters. All passing.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">8</span>
+        <h2 class="step-title">Mic Sensitivity and Auto-Leveling</h2>
+
+        <div class="prompt">
+            I think we need more sensitive auto-scaling — it's still hard to get much of a display. Maybe the processing mode is only getting a quiet signal from the mic?
+        </div>
+
+        <div class="response">
+            Three issues were identified working together to suppress the display:
+            <br><br>
+            <strong>1. Audio session mode</strong>: <code>.measurement</code> mode disables the iPhone's automatic gain control, resulting in very quiet raw mic input. Switching to <code>.default</code> mode enables AGC for maximum sensitivity.
+            <br><br>
+            <strong>2. FFT normalisation</strong>: The power spectrum was normalised by <code>1/N²</code>, but for a one-sided spectrum (discarding the symmetric negative frequencies) the correct factor is <code>4/N²</code> — a +6dB boost.
+            <br><br>
+            <strong>3. Auto-level too conservative</strong>: The minimum ceiling of -30dB was too high, and the 60dB display range too wide. Changed to ceiling [-60, 0] with a 40dB window for much more visual sensitivity.
+        </div>
+
+        <div class="outcome">
+            The display now fills with activity even in a quiet room. dB labels update dynamically to show the current auto-leveled range, confirming the adaptation is working.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">9</span>
+        <h2 class="step-title">60fps Smoothing and FPS Counter</h2>
+
+        <div class="prompt">
+            Could we have an FPS display in the corner of the screen? I'm hoping the decay of the display can be ultra-smooth pro graphics quality.
+        </div>
+
+        <div class="response">
+            The fundamental issue was that smoothing happened at the audio callback rate (~21fps), not the display rate (60fps). Bars would jump 21 times per second with dead frames in between — visible as micro-stuttering.
+            <br><br>
+            The fix was to decouple the animation from the audio pipeline entirely. AudioEngine now publishes <strong>raw normalised</strong> spectrum data. MetalRenderer maintains its own <code>displaySpectrum</code> array and interpolates toward the target values every frame at 60fps using asymmetric lerp — fast attack (0.35) for responsive rises, slow decay (0.12) for smooth, professional-quality falls. Peak tracking also moved to 60fps with a gentle 0.006/frame decay (~3.5 seconds for a full fall).
+            <br><br>
+            An FPS counter was added by tracking frame times in the renderer and displaying via a SwiftUI overlay that polls the shared coordinator every 0.5 seconds.
+        </div>
+
+        <div class="outcome">
+            The display runs at a locked 60fps with silky-smooth bar rises and falls. The decoupled architecture means even if the audio callback rate varies, the animation quality is consistent.
+        </div>
+
+        <div class="tech-note">
+            Asymmetric smoothing is key to professional audio visualisers. Equal attack and decay feels "mushy" — sounds seem to linger too long. Fast attack (0.35) captures transients like drum hits instantly, while slow decay (0.12) creates a smooth, natural fade that reads as "energy dissipating" rather than "signal dropping". The 3:1 ratio between attack and decay is a common starting point in pro audio metering.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">10</span>
+        <h2 class="step-title">Architecture as a Technical Article</h2>
+
+        <div class="prompt">
+            Could you make architecture.html something more like an article I would read in a technical magazine? Nice intro, explanation of the narrative... and could you add inline diagrams and images? The DSP sections aren't very clear to read — could you format them better?
+        </div>
+
+        <div class="response">
+            The architecture document was transformed from a flat reference into a three-part technical article. A magazine-style introduction sets the scene — what a spectrum analyser does, why the architecture splits into CPU audio and GPU rendering, and the key insight about decoupled rates.
+            <br><br>
+            The math blocks were completely restyled with colour-coded syntax: cyan for variables, purple for functions, green for numbers, orange for operators, blue headings for visual hierarchy, and proper HTML tables replacing monospaced columns. Inline SVG diagrams were added throughout — a Hanning window visualisation, a time-to-frequency domain transform, a linear-vs-logarithmic band comparison, an auto-leveling before/after, a CPU/GPU pipeline split, gradient colour ramps, a memory alignment bug diagram, and a full-colour spectrogram heatmap simulation.
+        </div>
+
+        <div class="outcome">
+            The architecture document now reads as a self-contained article explaining how to build a real-time spectrum analyser, from microphone to pixel. Each mathematical concept is introduced with context, visualised with a diagram, expressed with formatted equations, and grounded with the specific vDSP function and NEON instruction count that implements it.
+        </div>
+    </div>
+</body>
+</html>

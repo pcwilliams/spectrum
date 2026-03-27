@@ -15,6 +15,11 @@
 		4A0000000000000000000022 /* SpectrumMetalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000000000000000000018 /* SpectrumMetalView.swift */; };
 		4A0000000000000000000023 /* Shaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000000000000000000019 /* Shaders.metal */; };
 		4A0000000000000000000024 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 4A000000000000000000001A /* Assets.xcassets */; };
+		4A0000000000000000000040 /* MusicPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A000000000000000000003B /* MusicPlayer.swift */; };
+		4A0000000000000000000041 /* MusicBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A000000000000000000003C /* MusicBrowserView.swift */; };
+		4A0000000000000000000042 /* TransportBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A000000000000000000003D /* TransportBarView.swift */; };
+		4A0000000000000000000050 /* test_tone.wav in Resources */ = {isa = PBXBuildFile; fileRef = 4A000000000000000000004F /* test_tone.wav */; };
+		4A0000000000000000000052 /* pink_tone.wav in Resources */ = {isa = PBXBuildFile; fileRef = 4A0000000000000000000051 /* pink_tone.wav */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -39,6 +44,11 @@
 		4A000000000000000000001B /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		4A000000000000000000001C /* Spectrum.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Spectrum.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		4A000000000000000000003A /* SpectrumTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SpectrumTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		4A000000000000000000003B /* MusicPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicPlayer.swift; sourceTree = "<group>"; };
+		4A000000000000000000003C /* MusicBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicBrowserView.swift; sourceTree = "<group>"; };
+		4A000000000000000000003D /* TransportBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransportBarView.swift; sourceTree = "<group>"; };
+		4A000000000000000000004F /* test_tone.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; path = test_tone.wav; sourceTree = "<group>"; };
+		4A0000000000000000000051 /* pink_tone.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; path = pink_tone.wav; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -83,8 +93,11 @@
 				4A000000000000000000000F /* Audio */,
 				4A0000000000000000000010 /* Models */,
 				4A0000000000000000000011 /* Rendering */,
+				4A000000000000000000003E /* Views */,
 				4A000000000000000000001A /* Assets.xcassets */,
 				4A000000000000000000001B /* Info.plist */,
+				4A000000000000000000004F /* test_tone.wav */,
+				4A0000000000000000000051 /* pink_tone.wav */,
 			);
 			path = Spectrum;
 			sourceTree = "<group>";
@@ -102,6 +115,7 @@
 			isa = PBXGroup;
 			children = (
 				4A0000000000000000000015 /* AudioEngine.swift */,
+				4A000000000000000000003B /* MusicPlayer.swift */,
 			);
 			path = Audio;
 			sourceTree = "<group>";
@@ -122,6 +136,15 @@
 				4A0000000000000000000019 /* Shaders.metal */,
 			);
 			path = Rendering;
+			sourceTree = "<group>";
+		};
+		4A000000000000000000003E /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				4A000000000000000000003C /* MusicBrowserView.swift */,
+				4A000000000000000000003D /* TransportBarView.swift */,
+			);
+			path = Views;
 			sourceTree = "<group>";
 		};
 		4A0000000000000000000012 /* Products */ = {
@@ -218,6 +241,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				4A0000000000000000000024 /* Assets.xcassets in Resources */,
+				4A0000000000000000000050 /* test_tone.wav in Resources */,
+				4A0000000000000000000052 /* pink_tone.wav in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -242,6 +267,9 @@
 				4A0000000000000000000021 /* MetalRenderer.swift in Sources */,
 				4A0000000000000000000022 /* SpectrumMetalView.swift in Sources */,
 				4A0000000000000000000023 /* Shaders.metal in Sources */,
+				4A0000000000000000000040 /* MusicPlayer.swift in Sources */,
+				4A0000000000000000000041 /* MusicBrowserView.swift in Sources */,
+				4A0000000000000000000042 /* TransportBarView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

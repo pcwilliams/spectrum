@@ -2,11 +2,24 @@ import Metal
 import MetalKit
 import simd
 
+/// Vertex data sent to the GPU. Must match the Metal `Vertex` struct layout:
+/// non-packed `float2` + `float4` = 32 bytes stride (SIMD4 has 16-byte alignment).
+/// Using `packed_float2/4` in Metal would be 24 bytes, causing garbled rendering.
 struct SpectrumVertex {
     var position: SIMD2<Float>
     var color: SIMD4<Float>
 }
 
+/// Drives all GPU rendering at 60fps via Metal.
+///
+/// Reads raw spectrum data from `AudioEngine` and applies its own 60fps
+/// asymmetric smoothing (fast attack, slow decay) and peak tracking,
+/// decoupled from the ~21fps audio callback rate. This produces silky-smooth
+/// animation regardless of audio update timing.
+///
+/// All four visualisation modes share a single vertex/fragment shader pipeline.
+/// The CPU builds coloured triangle vertices each frame (up to 200K), uploads
+/// them to a pre-allocated Metal buffer, and issues a single draw call.
 class MetalRenderer: NSObject, MTKViewDelegate {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -30,12 +43,17 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private let waveBottom = SpectrumLayout.waveformBottom
     private let waveTop = SpectrumLayout.waveformTop
 
-    // 60fps display smoothing (decoupled from audio rate)
+    // 60fps display smoothing (decoupled from ~21fps audio callback rate)
+    //
+    // Asymmetric lerp is key to professional-quality audio visualisers:
+    // fast attack captures transients like drum hits instantly, while slow
+    // decay creates a smooth, natural fade. The 3:1 ratio between attack
+    // and decay is a common starting point in pro audio metering.
     private var displaySpectrum: [Float]
     private var displayPeaks: [Float]
-    private let smoothingLerp: Float = 0.35      // rise speed (per frame at 60fps)
-    private let decayLerp: Float = 0.12           // fall speed — slower for smooth decay
-    private let peakDecayRate: Float = 0.006      // peak dots fall gently
+    private let smoothingLerp: Float = 0.35      // attack speed (per frame at 60fps)
+    private let decayLerp: Float = 0.12           // decay speed — slower for smooth falls
+    private let peakDecayRate: Float = 0.006      // peak indicators fall gently (~3.5s full fall)
 
     // Spectrogram history (circular buffer)
     private var spectrogramBuffer: [[Float]]
@@ -449,8 +467,11 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    // MARK: - Helpers
+    // MARK: - Colour Helpers (static for testability)
 
+    /// Maps a frequency position (0=low, 1=high) to a colour along a five-stop
+    /// gradient: blue → cyan → green → yellow → red. Provides good perceptual
+    /// contrast across the spectrum.
     static func gradientColor(at t: Float) -> SIMD4<Float> {
         if t < 0.25 {
             let s = t / 0.25
@@ -467,6 +488,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    /// Maps intensity (0=silence, 1=peak) to a heatmap colour for spectrogram mode.
+    /// Starts from black (making quiet regions visually distinct from the background),
+    /// through dark blue → cyan → yellow → red.
     static func heatmapColor(_ value: Float) -> SIMD4<Float> {
         let v = max(0, min(1, value))
         if v < 0.25 {
@@ -484,6 +508,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    /// Adds an axis-aligned quad (2 triangles, 6 vertices) with uniform colour.
     private func addQuad(to vertices: inout [SpectrumVertex],
                           x0: Float, y0: Float, x1: Float, y1: Float,
                           color: SIMD4<Float>) {
@@ -496,6 +521,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         vertices.append(SpectrumVertex(position: SIMD2(x1, y1), color: color))
     }
 
+    /// Adds an axis-aligned quad with a vertical colour gradient (bottom → top).
     private func addGradientQuad(to vertices: inout [SpectrumVertex],
                                   x0: Float, y0: Float, x1: Float, y1: Float,
                                   bottomColor: SIMD4<Float>, topColor: SIMD4<Float>) {

@@ -253,10 +253,14 @@
 
     <div class="diagram-section">
         <h2>Audio Processing Pipeline — Overview</h2>
-        <p>The eight stages of the audio pipeline, from raw microphone input to normalised frequency bands. Each box is a vDSP function call — the entire chain executes in ~10 microseconds.</p>
+        <p>The audio pipeline accepts input from either the microphone or a music file. Both sources share the same FFT processing chain — the only difference is which node's tap feeds the buffer. A single persistent <code>AVAudioEngine</code> manages the entire graph: all nodes (playerNode, musicMixer) are connected before the engine starts, and source switching only swaps taps. The eight FFT stages execute in ~10 microseconds.</p>
+        <p>Music files are sourced from the device library via <code>MPMediaQuery</code>, filtered through three checks: <code>assetURL != nil</code> (rejects cloud-only), <code>hasProtectedAsset == false</code> (rejects DRM), and URL extension is not <code>.movpkg</code> (rejects Apple Music cached streaming packages that appear local but use an undecipherable container format).</p>
+        <p>In music mode, an exponential spectral tilt is applied after band mapping to compensate for the steep high-frequency rolloff of commercial music. Bass below 200Hz is left untouched; above 200Hz, each band is boosted by <code>rate × octaves<sup>power</sup></code> dB, where <em>rate</em>=5.0 and <em>power</em>=1.4. This makes the full 20Hz–20kHz range visually active rather than being dominated by bass energy.</p>
         <div class="mermaid">
             graph TD
-                A[Microphone] -->|PCM Audio| B[AVAudioEngine]
+                A1[Microphone] -->|PCM Audio| B[AVAudioEngine]
+                A2[Music File] -->|AVAudioPlayerNode| PM[musicMixer]
+                PM --> B
                 B -->|installTap| C[Audio Buffer<br/>2048 samples]
                 C --> D[Hanning Window]
                 D --> E[vDSP_ctoz<br/>Pack split complex]
@@ -264,8 +268,9 @@
                 F --> G[vDSP_zvmags<br/>Squared magnitudes]
                 G --> H[vDSP_vdbcon<br/>Power to dB]
                 H --> I[Log Band Mapping<br/>128 bands, 20Hz-20kHz]
-                I --> J[Smoothing + Peak Tracking]
-                J -->|Main Thread| K["@Published Data"]
+                I --> ST[Spectral Tilt<br/>Music mode only]
+                ST --> J[Smoothing + Peak Tracking]
+                J -->|Main Thread| K[Spectrum Data]
         </div>
     </div>
 
@@ -676,6 +681,7 @@
         <div class="mermaid">
             graph TD
                 A[SpectrumApp] --> B[ContentView]
+                B --> ST[Source Toggle<br/>Mic / Music]
                 B --> C[Segmented Picker<br/>Mode Selection]
                 B --> D[ZStack]
                 D --> E[SpectrumMetalView<br/>UIViewRepresentable]
@@ -685,6 +691,8 @@
                 F --> I[dB Scale Labels]
                 F --> J[Frequency Labels]
                 F --> K[Waveform Label]
+                B --> TB[TransportBarView<br/>Now Playing Controls]
+                B --> MB[MusicBrowserView<br/>Track List by Artist]
                 B --> L[Permission Denied View]
         </div>
     </div>
@@ -1197,7 +1205,6 @@
         <div class="mermaid">
             graph TD
                 A[AudioEngine<br/>ObservableObject] -->|spectrumData<br/>128 floats| B[MetalRenderer]
-                A -->|peakData<br/>128 floats| B
                 A -->|waveformData<br/>512 floats| B
                 A -->|permissionDenied<br/>isRunning| C[ContentView]
                 C -->|mode| D[SpectrumMetalView]

@@ -319,5 +319,171 @@
             The architecture document now reads as a self-contained article explaining how to build a real-time spectrum analyser, from microphone to pixel. Each mathematical concept is introduced with context, visualised with a diagram, expressed with formatted equations, and grounded with the specific vDSP function and NEON instruction count that implements it.
         </div>
     </div>
+
+    <div class="step">
+        <span class="step-number">11</span>
+        <h2 class="step-title">Music Playback Mode</h2>
+
+        <div class="prompt">
+            The list of songs contains many that won't play. Could we filter out DRM-protected tracks and add a music playback mode with spectrum analysis?
+        </div>
+
+        <div class="response">
+            Music playback required a second audio path through AVAudioEngine: <code>AVAudioPlayerNode</code> → <code>AVAudioMixerNode</code> (with FFT tap) → <code>mainMixerNode</code>. The mixer tap feeds the same FFT pipeline as the mic, so all four visualisation modes work identically with music.
+            <br><br>
+            The music library is loaded via <code>MPMediaQuery.songs()</code> with DRM filtering. A <code>MusicBrowserView</code> shows the filtered track list with artist sections, and a <code>TransportBarView</code> provides play/pause/stop controls with a swipe-up gesture to reveal the browser.
+        </div>
+
+        <div class="outcome">
+            Music mode works for purchased and imported tracks. The UI includes a source toggle (mic/music icons), a scrollable track browser, and transport controls.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">12</span>
+        <h2 class="step-title">The Audio Session Saga — Part 1</h2>
+
+        <div class="prompt">
+            The list of songs contains many that won't play — like "Take On Me". And if I switch to music mode and back to mic without playing anything, mic mode is broken forever.
+        </div>
+
+        <div class="response">
+            What followed was a long and humbling debugging session. The core problem was deceptively simple — switching between mic mode (<code>.record</code> audio session) and music mode (<code>.playAndRecord</code>) corrupted the audio hardware format, making <code>inputNode.outputFormat(forBus: 0)</code> return 0 Hz. But each attempted fix introduced new problems:
+            <br><br>
+            <strong>DRM detection spiral:</strong> The initial <code>AVAudioFile(forReading:)</code> header check let DRM tracks through. Trying <code>AVURLAsset.hasProtectedContent</code> rejected everything — including playable tracks. Reading 4096 audio frames as a validation check passed for DRM tracks too. Checking for silent audio data didn't help either. Attempting to remove tracks at play time when they failed caused all tracks to be removed because the engine wasn't starting properly. Each "fix" broke something else.
+            <br><br>
+            <strong>Engine corruption spiral:</strong> The repeated engine creation/destruction and audio session category changes left the phone's audio subsystem in a corrupted state — 0 Hz sample rate on every new engine. Multiple phone reboots were needed during the session. At one point the app was crashing on startup from an <code>installTap</code> call with an invalid format — an Objective-C <code>NSException</code> that Swift's <code>do/catch</code> cannot intercept.
+        </div>
+
+        <div class="outcome">
+            After several hours of going in circles — each fix creating a new problem — we made the difficult but correct decision to stop, restore from the last known working backup (spectrum copy 3), update all documentation with lessons learned, and research the proper architecture overnight before attempting any more changes.
+        </div>
+
+        <div class="tech-note">
+            The key lesson: when iterative fixes keep introducing new problems, stop and research. Don't keep layering patches on a broken foundation. Restore to the last known good state, document everything you've learned, and design the proper solution before writing more code. The cost of continuing to iterate was multiple phone reboots, corrupted audio state, and hours of lost time.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">13</span>
+        <h2 class="step-title">The Audio Session Saga — Part 2: Research, Don't Guess</h2>
+
+        <div class="prompt">
+            Could you research overnight how to properly switch between mic and music playback modes? Take as long as you need to get it right. Then tomorrow we can try without breaking things.
+        </div>
+
+        <div class="response">
+            The research phase was thorough — examining Apple's documentation, AudioKit's source code, Apple developer forums, WWDC sessions, and the AVAudioEngine sample projects. Four key insights emerged:
+            <br><br>
+            <strong>1. Never recreate the engine.</strong> A single <code>AVAudioEngine</code> instance should live for the entire app lifetime. Creating fresh engines mid-lifecycle causes 0 Hz formats and RPC timeouts. Apple's own sample code and AudioKit both use a single persistent engine.
+            <br><br>
+            <strong>2. Never change the audio session category.</strong> Use <code>.playAndRecord</code> with <code>.defaultToSpeaker</code> from the very start. The mic quality and AGC behaviour are identical to <code>.record</code> when both use <code>.default</code> mode. There is no quality penalty.
+            <br><br>
+            <strong>3. Swap taps, not engines.</strong> <code>installTap</code> and <code>removeTap</code> are documented as safe while the engine is running. Source switching just means removing one tap and installing another.
+            <br><br>
+            <strong>4. Use <code>hasProtectedAsset</code> for DRM.</strong> <code>MPMediaItem.hasProtectedAsset</code> (iOS 9.2+) reliably identifies DRM-protected tracks. Since 2024, all iTunes Store purchases are DRM-free.
+        </div>
+
+        <div class="outcome">
+            The research gave us a clear architectural blueprint. But implementing it revealed one more critical constraint that the research hadn't fully emphasised...
+        </div>
+
+        <div class="tech-note">
+            The most important lesson of the entire project: <strong>when iterative fixes keep introducing new problems, stop guessing and research</strong>. Reading AudioKit's source code for 10 minutes revealed patterns that hours of trial-and-error debugging had missed. The Apple Developer Forums had posts from 2017 describing the exact same "disconnected state" crash we were hitting. The answers were there — we just needed to look.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">14</span>
+        <h2 class="step-title">The Audio Session Saga — Part 3: The Breakthrough</h2>
+
+        <div class="prompt">
+            I think you need to research how to play DRM-free music successfully after switching from mic input. And how to return to mic input after playback. You should also research how to play your test WAV file in the simulator, so you can iterate until it works — just in a loop running the simulator via command line. When I finally deploy to the phone, there should be no guessing whether it will work.
+        </div>
+
+        <div class="response">
+            The second round of research, focused on the specific "player started when in a disconnected state" crash, found the critical missing piece (AudioKit Issue #2527):
+            <br><br>
+            <strong>All nodes must be connected BEFORE <code>engine.start()</code>.</strong> Calling <code>engine.connect()</code> on a running engine silently stops it and permanently marks the playerNode as "disconnected" at the CoreAudio C++ level. No amount of reconnecting, restarting, or resetting recovers it. The only solution: connect everything <em>before</em> the engine ever starts.
+            <br><br>
+            Additionally, <strong>nodes must never be disconnected</strong>. Calling <code>engine.disconnectNodeOutput()</code> permanently breaks the node. Idle connected nodes pass silence at zero CPU cost — confirmed by AudioKit's own architecture.
+            <br><br>
+            For simulator testing: use <code>.playback</code> category (not <code>.playAndRecord</code>) and skip <code>engine.inputNode</code> access entirely. This lets the simulator play files through <code>AVAudioPlayerNode</code> without the mic hardware that it lacks.
+        </div>
+
+        <div class="outcome">
+            The final architecture was elegant in its simplicity:
+            <br><br>
+            <strong>1.</strong> Configure audio session once<br>
+            <strong>2.</strong> Attach playerNode and musicMixer<br>
+            <strong>3.</strong> Connect playerNode → musicMixer → mainMixerNode<br>
+            <strong>4.</strong> Install mic tap on inputNode<br>
+            <strong>5.</strong> <code>engine.prepare()</code>, then <code>engine.start()</code><br>
+            <strong>6.</strong> Source switching: <code>removeTap</code> + <code>installTap</code> — nothing else changes
+            <br><br>
+            A bundled <code>test_tone.wav</code> (440Hz + 880Hz sine wave, 3 seconds) enabled fully automated simulator testing. Six launch configurations were tested — all four visualisation modes with the test file, plus default launch and mic-only — zero crashes, all showing correct frequency peaks at 59-60fps. The spectrum analyser clearly displayed the 440Hz fundamental and 880Hz overtone as distinct bars.
+        </div>
+
+        <div class="tech-note">
+            The correct sequence is: <strong>attach → connect → prepare → start → installTap → scheduleFile → play</strong>. Every other ordering crashes. The simulator uses <code>#if targetEnvironment(simulator)</code> for <code>.playback</code> category and to skip <code>inputNode</code> access. On device, <code>.playAndRecord</code> + <code>.defaultToSpeaker</code> enables both mic and music.
+            <br><br>
+            <strong>The debugging approach that finally worked:</strong> comprehensive logging (<code>alog()</code> writing to Documents/spectrum.log), targeted research on the specific crash message, simulator-first testing with automated scripts, and only deploying to the phone when all simulator tests passed. Contrast this with the earlier approach of guessing → deploy → crash → guess again → corrupt audio → reboot phone.
+        </div>
+    </div>
+    <div class="step">
+        <span class="step-number">15</span>
+        <h2 class="step-title">The .movpkg Mystery — Catching Unplayable Tracks</h2>
+
+        <div class="prompt">
+            We were about to make the song list more able to detect unplayable tracks. Could we add some diagnostic trace to dump every track's attributes — DRM status, cloud status, URL extension, whether AVAudioFile can actually open it?
+        </div>
+
+        <div class="response">
+            A diagnostic loop was added to <code>loadLibrary()</code> that printed every track's attributes: <code>hasProtectedAsset</code>, <code>isCloudItem</code>, <code>mediaType</code>, <code>assetURL</code> file extension, and an <code>AVAudioFile(forReading:)</code> readability check. Running on a real device with a mixed library (purchased, imported, Apple Music subscription) revealed the pattern immediately.
+            <br><br>
+            Five versions of a-ha's "Take On Me" told the whole story:
+            <br><br>
+            <strong>Playable:</strong> <code>url=item.m4a</code> — a 2007 iTunes Store purchase, <code>protected=false</code>, <code>cloud=false</code>, <code>AVAudioFile=YES</code><br>
+            <strong>Unplayable:</strong> <code>url=item.movpkg</code> — Apple Music subscription versions (2015–2022), <code>protected=false</code>, <code>cloud=false</code>, <code>AVAudioFile=NO</code> (error 2003334207)<br>
+            <strong>No URL:</strong> <code>url=nil</code> — cloud-only with <code>cloud=true</code>, already filtered
+            <br><br>
+            The <code>.movpkg</code> extension is the key. These are Apple Music cached streaming packages — downloaded for offline playback but stored in a container format that <code>AVAudioFile</code> (and therefore <code>AVAudioPlayerNode</code>) cannot decode. They slip through both <code>hasProtectedAsset</code> and <code>isCloudItem</code> checks because from the system's perspective they are local and not DRM-protected in the traditional sense.
+        </div>
+
+        <div class="outcome">
+            A single line was added to the filter: reject tracks where <code>url.pathExtension == "movpkg"</code>. This gives a clean three-tier filter: no URL → DRM-protected → streaming package. The summary log now breaks out the movpkg count separately. The chatty per-track diagnostic was commented out but kept for future debugging.
+        </div>
+
+        <div class="tech-note">
+            Error 2003334207 is <code>'typ?'</code> in FourCC — "unsupported file type". The <code>.movpkg</code> format is a directory bundle containing encrypted HLS segments, not a flat audio file. Apple's MediaPlayer framework can play these (it has the streaming decryption keys), but <code>AVAudioFile</code> expects a plain audio container (M4A, MP3, WAV, etc.). This is why <code>hasProtectedAsset</code> returns false — the DRM is at the streaming transport layer, not the file metadata layer.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">16</span>
+        <h2 class="step-title">Spectral Tilt — Making Music Come Alive Above 2kHz</h2>
+
+        <div class="prompt">
+            Playing real music, I'm seeing hardly anything above 2kHz. The bass dominates everything. I really think we need per-octave gain adaptation for music mode. Is that the best approach?
+        </div>
+
+        <div class="response">
+            The problem is fundamental to how music works: commercial music typically follows a pink noise spectrum with energy rolling off at roughly -3dB per octave. Bass frequencies can be 30-40dB louder than treble. With a single auto-leveling window, the bass fills the display and the treble is invisible.
+            <br><br>
+            Two approaches were considered: a static linear tilt (fixed dB/octave boost) and per-octave auto-leveling (independent normalization per octave). The linear tilt was tried first as the simpler option — but even at 4.5dB/octave, then 6.5, then 9dB/octave, the upper frequencies remained stubbornly quiet. A linear correction simply couldn't keep up with the accelerating rolloff.
+            <br><br>
+            The breakthrough came when the user asked: <em>"Do we need an exponential tilt?"</em> Instead of a constant dB/octave boost, the correction uses <code>rate × octaves<sup>power</sup></code> — accelerating the boost the further you get from the reference frequency. This matches the way music's spectral energy actually falls off.
+        </div>
+
+        <div class="outcome">
+            After iterating through several curve shapes — some of which wiped out the bass entirely by boosting <em>and</em> cutting symmetrically around 1kHz — the final solution only boosts above 200Hz, leaving bass untouched. With <code>rate=5.0</code> and <code>power=1.4</code>, the boost at 2kHz is ~15dB and at 10kHz is ~50dB, making the full spectrum visually active in music mode.
+            <br><br>
+            Crucially, the testing workflow itself improved during this process. The simulator's quiet audio made it impossible to see anything until a <code>-gain</code> launch argument was added to apply a static dB boost post-FFT. Combined with a purpose-built <code>pink_tone.wav</code> test file (29 tones at 1/3-octave intervals with -3dB/octave rolloff), the spectral tilt could be visually verified entirely from the command line — no device deployment needed for each iteration.
+        </div>
+
+        <div class="tech-note">
+            The exponential tilt formula is: <code>boost = rate × octaves_above_ref<sup>power</sup></code>. With rate=5.0 and power=1.4, the curve is sublinear near the reference (gentle at 500Hz–2kHz) but superlinear far from it (aggressive at 8kHz–20kHz). This matches the empirical observation that music's spectral rolloff isn't constant — it steepens above ~3kHz as harmonic content thins out. The key insight was applying the boost only above the reference, not symmetrically — the symmetric version was cutting bass by 100+dB at 30Hz, completely destroying the low end.
+        </div>
+    </div>
 </body>
 </html>

@@ -230,18 +230,33 @@ Capture the essence of the prompt, the approach taken, and the outcome. This doc
 
 ## Overview
 
-Real-time audio spectrum analyser for iPhone. Captures microphone input, performs FFT analysis using Apple's Accelerate framework (vDSP), and renders four GPU-accelerated visualisation modes via Metal at 60fps with silky-smooth animation.
+Real-time audio spectrum analyser for iPhone. Captures microphone input or plays local music files, performs FFT analysis using Apple's Accelerate framework (vDSP), and renders four GPU-accelerated visualisation modes via Metal at 60fps with silky-smooth animation.
 
 ## Architecture
 
 ### Data Flow
 
 ```
-Microphone → AVAudioEngine (tap) → vDSP FFT → Log band mapping → Auto-level → Normalise
-                                                                                    ↓
-                                                             SwiftUI ← @Published ← DispatchQueue.main
-                                                                  ↓
-                                              MTKView → MetalRenderer (60fps smoothing + peak tracking) → GPU
+Mic mode:   Microphone → AVAudioEngine (inputNode tap) → vDSP FFT → Log bands → Auto-level → Normalise
+Music mode: AVAudioFile → AVAudioPlayerNode → musicMixer (tap) → vDSP FFT → Log bands → Auto-level → Normalise
+                                                                                                          ↓
+                                                                            SwiftUI ← direct read ← DispatchQueue.main
+                                                                                 ↓
+                                                             MTKView → MetalRenderer (60fps smoothing + peak tracking) → GPU
+```
+
+### Engine Lifecycle (Critical)
+
+```
+1. Configure audio session (.playAndRecord on device, .playback on simulator)
+2. engine.attach(playerNode)
+3. engine.attach(musicMixer)
+4. engine.connect(playerNode, to: musicMixer, format: mixerFormat)     ← MUST be before start()
+5. engine.connect(musicMixer, to: engine.mainMixerNode, format: mixerFormat)  ← MUST be before start()
+6. engine.inputNode.installTap(...)  [device only]
+7. engine.prepare()
+8. engine.start()
+9. Source switching: removeTap + installTap only — never disconnect/reconnect nodes
 ```
 
 ### Key Design Decisions
@@ -249,9 +264,17 @@ Microphone → AVAudioEngine (tap) → vDSP FFT → Log band mapping → Auto-le
 - **CPU for FFT, GPU for rendering**: Accelerate/vDSP is SIMD-optimised and faster than GPU compute for typical audio buffer sizes (2048 samples). The GPU-to-CPU data transfer overhead would negate any Metal compute advantage.
 - **Single vertex pipeline**: All four visualisation modes use the same Metal vertex/fragment pipeline with `.triangle` primitives. The spectrogram uses CPU-generated coloured quads rather than a texture, keeping the pipeline simple.
 - **Decoupled audio and display rates**: AudioEngine publishes raw normalised spectrum data at ~21fps (audio callback rate). MetalRenderer applies its own 60fps asymmetric smoothing (fast attack, slow decay) for buttery animation independent of the audio update rate.
-- **Direct data reading**: The MetalRenderer holds a weak reference to AudioEngine and reads `@Published` data directly in the draw call. Both run on the main thread (CADisplayLink on iOS), so no locking is needed.
+- **Direct data reading (no @Published for audio data)**: The MetalRenderer holds a weak reference to AudioEngine and reads `spectrumData`/`waveformData`/`dbFloor`/`dbCeiling` directly. These are NOT `@Published` — this eliminates unnecessary SwiftUI re-render cycles per second. Both run on the main thread (CADisplayLink on iOS), so no locking is needed. The dB labels refresh via the 0.5s FPS timer. MetalRenderer maintains its own `displayPeaks` array — AudioEngine does not provide peak data.
 - **Circular buffer for spectrogram**: Avoids array shifting overhead. Write index advances every 3rd frame (~20fps), read wraps around.
 - **Auto-leveling over fixed range**: The display adapts to the current signal level rather than mapping a fixed dB range, ensuring responsive visuals in any environment from quiet rooms to concerts.
+- **Exponential spectral tilt for music mode**: Commercial music has dramatically more energy in bass than treble. In music mode, an exponential dB boost is applied above 200Hz (`rate * octaves^power`), ramping up aggressively toward 20kHz. Bass below 200Hz is untouched. This makes the full spectrum visually active without distorting the natural bass response. Parameters: `musicTiltRate=5.0`, `musicTiltPower=1.4`.
+- **Single persistent engine**: One `AVAudioEngine` instance (`let`, never recreated) for the entire app lifetime. Recreating engines mid-lifecycle causes 0 Hz formats and RPC timeouts.
+- **Connect ALL nodes before engine.start()**: `playerNode` and `musicMixer` are attached AND connected before `engine.start()`. Connecting after start permanently breaks playerNode with an uncatchable ObjC exception ("player started when in a disconnected state"). This is the single most important architectural rule. `engine.prepare()` is called before `engine.start()`.
+- **Nodes never disconnected**: Idle connected nodes pass silence at zero CPU cost (confirmed by AudioKit source). Disconnecting and reconnecting nodes causes crashes. The full graph stays wired at all times.
+- **`.playAndRecord` + `.defaultToSpeaker`** on device; **`.playback`** on simulator (`#if targetEnvironment(simulator)`). The category is set once and never changed. Mic quality/AGC is identical between `.record` and `.playAndRecord` when both use `.default` mode.
+- **Tap swapping for source switching**: `installTap`/`removeTap` are safe while the engine is running (Apple-documented). Source switching only swaps taps — nodes stay connected.
+- **Load music library once**: The library is scanned once on first access and cached. Rescanning under different audio session states gives inconsistent results.
+- **DRM-aware music library**: Three-tier filtering: (1) `assetURL != nil` rejects cloud-only tracks, (2) `hasProtectedAsset` (iOS 9.2+) rejects DRM-protected tracks, (3) `.movpkg` URL extension rejects Apple Music cached streaming packages — these appear local (`cloud=false`, `protected=false`) but `AVAudioFile` can't read them. Since 2024, all iTunes Store purchases are DRM-free, so tracks passing all three checks are reliably playable.
 
 ## Project Structure
 
@@ -265,16 +288,22 @@ Spectrum/
 ├── Spectrum/
 │   ├── App/
 │   │   ├── SpectrumApp.swift          # @main entry point
-│   │   └── ContentView.swift          # Root view with mode picker, labels, FPS counter, launch args
+│   │   └── ContentView.swift          # Root view, source/mode pickers, labels, FPS, -testfile support
 │   ├── Audio/
-│   │   └── AudioEngine.swift          # AVAudioEngine + vDSP FFT + auto-leveling
+│   │   ├── AudioEngine.swift          # Single persistent AVAudioEngine + vDSP FFT + tap swapping
+│   │   └── MusicPlayer.swift          # MPMediaQuery library browsing + hasProtectedAsset DRM filter
 │   ├── Models/
-│   │   └── SpectrumData.swift         # VisualizationMode enum, SpectrumLayout constants
+│   │   └── SpectrumData.swift         # AudioSource enum, VisualizationMode enum, SpectrumLayout constants
 │   ├── Rendering/
 │   │   ├── MetalRenderer.swift        # Metal rendering + 60fps smoothing + FPS tracking
 │   │   ├── SpectrumMetalView.swift    # UIViewRepresentable wrapping MTKView
 │   │   └── Shaders.metal              # Metal vertex/fragment shaders
-│   ├── Info.plist                      # NSMicrophoneUsageDescription
+│   ├── Views/
+│   │   ├── MusicBrowserView.swift     # Track list grouped by artist, DRM status, drag-to-close
+│   │   └── TransportBarView.swift     # Now-playing bar with play/pause/stop, swipe-up to browse
+│   ├── Info.plist                      # NSMicrophoneUsageDescription + NSAppleMusicUsageDescription
+│   ├── test_tone.wav                   # Bundled 440Hz+880Hz test tone (3s) for automated testing
+│   ├── pink_tone.wav                   # 29-tone pink noise profile (25Hz–16kHz, -3dB/oct) for tilt testing
 │   └── Assets.xcassets/
 └── SpectrumTests/                      # PBXFileSystemSynchronizedRootGroup (auto-discovered)
     ├── AudioEngineTests.swift          # 21 tests: log band mapping, smoothing, peak tracking, auto-level
@@ -288,57 +317,68 @@ Spectrum/
 Standard SwiftUI @main entry point with WindowGroup containing ContentView.
 
 ### ContentView.swift
+- **Source toggle**: Custom icon buttons (mic.fill / music.note) for switching between mic and music input
 - Segmented picker for visualisation mode (Bars/Curve/Circular/Spectrogram)
-- **Launch argument parsing**: `-mode <value>` sets initial mode via `ProcessInfo.processInfo.arguments`
+- **Launch argument parsing**: `-mode <value>`, `-source <value>`, `-testfile <filename>`
 - Metal view taking full remaining space
-- GeometryReader overlay for **dynamic dB scale labels** (reflect auto-leveling range), frequency labels, "WAVEFORM" label
-- **FPS counter** in top-right corner, updated every 0.5s from renderer via shared coordinator
+- GeometryReader overlay for **dynamic dB scale labels**, frequency labels, "WAVEFORM" label
+- **FPS counter** in top-right corner, updated every 0.5s
+- **MusicBrowserView** at bottom when in music mode
+- **TransportBarView** when a track is playing
+- **Audio hardware alert**: Popup when 0 Hz or 0 input channels detected, asking user to restart phone
 - Permission denied state with instructions
+- `onChange(of: musicPlayer.isPlaying)` only handles pause/resume — initial play is handled by `playTrack` calling `playFile` directly
 
 ### AudioEngine.swift
-- `ObservableObject` with `@Published` spectrum (128 bands), waveform (512 samples), and adaptive dB range
-- Requests microphone permission via `AVAudioApplication.requestRecordPermission`
-- Configures `AVAudioSession` with `.record` category, `.default` mode (AGC enabled for maximum mic sensitivity)
-- Installs tap on `engine.inputNode` with buffer size 2048
+- `ObservableObject` with non-`@Published` spectrum (128 bands), waveform (512 samples), and adaptive dB range
+- **Single persistent engine** (`private let engine = AVAudioEngine()`) — never recreated
+- **`start()`**: Configures session, attaches nodes, connects ALL nodes, installs initial tap, prepares, starts engine. Uses `#if targetEnvironment(simulator)` for `.playback` category and music-only mode.
+- **`switchSource(to:)`**: Swaps taps only — `removeTap` on old source, `installTap` on new source. Nodes stay connected. On simulator, only music mode is supported.
+- **`playFile(url:)`**: Opens file, schedules on playerNode, calls `playerNode.play()`. Does NOT reconnect — existing connection handles format conversion.
+- **Format validation**: Checks `sampleRate > 0` and `channelCount > 0` before `installTap`
+- **`audioHardwareBroken`**: Published flag triggers UI alert when hardware is in bad state
+- **Debug logging**: Comprehensive `alog()` function writes to Documents/spectrum.log and console. Covers all user actions, state transitions, and engine events.
 - FFT pipeline: Hanning window → `vDSP_ctoz` → `vDSP_fft_zrip` → `vDSP_zvmags` → `vDSP_vdbcon`
-- **FFT normalisation**: `4/N²` (one-sided power spectrum correction, +6dB vs naive `1/N²`)
+- **FFT normalisation**: `4/N²` (one-sided power spectrum correction)
+- **Static gain boost**: Optional dB offset (`staticGainDB`) applied post-FFT for simulator testing with quiet audio. Set via `-gain` launch argument.
 - Logarithmic frequency band mapping: 20Hz–20kHz across 128 bands
-- **Auto-leveling**: tracks peak dB with instant rise and slow decay (0.5 dB/frame), adapts a 40dB display window. Ceiling clamped to [-60, 0] dB with 5dB headroom. Publishes `dbFloor`/`dbCeiling` for dynamic label display.
-- Normalises to 0–1 range using the adaptive dB window
-- Publishes **raw normalised** data — renderer handles smoothing at 60fps
+- **Exponential spectral tilt** (music mode only): Boosts frequencies above 200Hz using `rate * octaves^power` curve. Bass untouched, treble boosted aggressively to compensate for music's steep HF rolloff.
+- **Auto-leveling**: 40dB window, ceiling [-60, 0] dB with 5dB headroom
+
+### MusicPlayer.swift
+- `ObservableObject` managing music library access and playback state
+- Queries `MPMediaQuery.songs()`, three-tier filter: `assetURL != nil` + `hasProtectedAsset == false` + URL extension is not `.movpkg`
+- **Loads library once** — `requestAccessAndLoad()` guarded by `libraryLoaded`
+- Groups tracks by artist, sorted alphabetically
 
 ### SpectrumData.swift
+- `AudioSource` enum: `.mic`, `.music`
 - `VisualizationMode` enum: `.bars`, `.curve`, `.circular`, `.spectrogram`
 - `SpectrumLayout` with shared NDC coordinate constants and screen-coordinate conversion helpers
 
+### MusicBrowserView.swift
+- Track list grouped by artist with playing indicator (cyan speaker icon)
+- Drag handle header with close button; drag-to-dismiss gesture
+- Empty states: library access required, no eligible tracks (with DRM explanation), loading spinner
+
+### TransportBarView.swift
+- Now-playing bar: track name, play/pause button, stop button
+- Swipe-up gesture to show browser
+
 ### MetalRenderer.swift
 - `MTKViewDelegate` driving 60fps rendering
-- **60fps asymmetric smoothing**: fast attack (lerp 0.35) for responsive rises, slow decay (lerp 0.12) for smooth falls — decoupled from the ~21fps audio callback rate
+- **60fps asymmetric smoothing**: fast attack (lerp 0.35), slow decay (lerp 0.12)
 - **60fps peak tracking**: peaks rise instantly, decay at 0.006/frame (~3.5 seconds full fall)
-- **FPS counter**: tracks frame times, publishes `currentFPS` every 0.5s
-- Pre-allocates 200K-vertex Metal buffer (shared storage mode)
-- `reserveCapacity` based on mode before building vertices (spectrogram needs ~100K)
-- Builds all vertices on CPU, uploads to GPU via `copyMemory`, single draw call per frame
-- **Bars mode**: Gradient-coloured vertical bars with peak indicators (white horizontal lines)
-- **Curve mode**: Filled area under smooth curve with bright outline and peak dots
-- **Circular mode**: Radial bars from centre with aspect-ratio correction for portrait
-- **Spectrogram mode**: 128×128 grid of coloured quads from circular history buffer, throttled to ~20fps updates
-- **Waveform**: Cyan line trace in lower portion with centre reference line
-- Grid lines (dB horizontals + frequency verticals) for bars/curve modes
-- Gradient helper: blue→cyan→green→yellow→red based on frequency position
-- Heatmap helper: black→dark blue→cyan→yellow→red for spectrogram intensity
+- Pre-allocates 200K-vertex Metal buffer, single draw call per frame
+- Four modes: Bars, Curve, Circular, Spectrogram + waveform trace + grid lines
 
 ### SpectrumMetalView.swift
 - `UIViewRepresentable` wrapping `MTKView`
-- Accepts a shared `Coordinator` from ContentView (enables FPS readback)
-- Creates `MetalRenderer` in `makeUIView`, passes `AudioEngine` reference
-- Updates mode in `updateUIView` (only called on mode changes)
+- Shared `Coordinator` enables FPS readback from MetalRenderer
 
 ### Shaders.metal
 - Simple vertex pass-through shader (position + colour)
-- Fragment shader outputs interpolated vertex colour
-- Uses non-packed `float2`/`float4` types to match Swift's `SIMD2<Float>`/`SIMD4<Float>` alignment (32-byte stride)
-- Alpha blending enabled in pipeline for transparency effects
+- Non-packed `float2`/`float4` matching Swift's SIMD alignment (32-byte stride)
 
 ## Configuration
 
@@ -353,23 +393,75 @@ Standard SwiftUI @main entry point with WindowGroup containing ContentView.
 | Peak Decay Rate | 0.006/frame (~3.5s full fall) |
 | Auto-Level Range | 40dB window, ceiling [-60, 0] dB |
 | Auto-Level Decay | 0.5 dB/frame (~10 dB/sec) |
+| Music Spectral Tilt | Rate 5.0 dB/oct, power 1.4, ref 200Hz (above only) |
 | Spectrogram Depth | 128 frames (~20fps update rate) |
 | Max Vertices | 200,000 |
-| Audio Session | `.record` category, `.default` mode |
+| Audio Session (device) | `.playAndRecord` + `.defaultToSpeaker`, `.default` mode |
+| Audio Session (simulator) | `.playback`, `.default` mode |
 
 ## Launch Arguments
 
 | Argument | Description | Example |
 |----------|-------------|---------|
 | `-mode <value>` | Set initial visualisation mode: `bars`, `curve`, `circular`, `spectrogram` | `-mode spectrogram` |
+| `-source <value>` | Set initial audio source: `mic`, `music` | `-source music` |
+| `-testfile <name>` | Play a bundled audio file directly (skips music browser) | `-testfile test_tone.wav` |
+| `-gain <dB>` | Apply static dB boost to FFT output (for simulator testing with quiet audio) | `-gain 50` |
 
-Used for automated simulator testing:
+## Testing
+
+### Simulator Testing
+
+Music playback can be tested in the simulator using the bundled test tones. Use `-gain 50` to boost quiet simulator audio to exercise the full visualisation:
+
 ```bash
 xcrun simctl terminate booted com.pwilliams.Spectrum
-xcrun simctl launch booted com.pwilliams.Spectrum -- -mode circular
-sleep 2
+xcrun simctl launch booted com.pwilliams.Spectrum -- -testfile pink_tone.wav -mode bars -gain 50
+sleep 5
 xcrun simctl io booted screenshot /tmp/screenshot.png
 ```
+
+Two bundled test files:
+- `test_tone.wav` — 440Hz + 880Hz sine waves (3s), for verifying FFT peaks
+- `pink_tone.wav` — 29 tones at 1/3-octave intervals (25Hz–16kHz) with -3dB/octave rolloff, for testing spectral tilt compensation
+
+The simulator uses `.playback` category and skips mic input. All four visualisation modes work with test files. Note: a clean build is required after adding new WAV files — incremental builds may not copy resources.
+
+Note: Mic mode and source switching cannot be tested on the simulator — the audio daemon lacks mic hardware.
+
+### Unit Tests
+
+```bash
+xcodebuild -project Spectrum.xcodeproj -scheme Spectrum \
+  -destination 'platform=iOS Simulator,name=iPhone 16' test \
+  CODE_SIGNING_ALLOWED=NO
+```
+
+46 tests across three suites covering FFT logic, colour functions, and layout constants.
+
+### Device Testing
+
+Device testing is required for:
+- Mic input and visualisation
+- Source switching (mic → music → play → mic cycle)
+- Music library browsing with DRM filtering
+- Playing actual purchased/imported tracks
+
+### Approach to Debugging Audio Issues
+
+**Research before iterating.** Audio engine issues are extremely difficult to debug through trial-and-error because:
+- Each failed attempt can corrupt the phone's audio subsystem (requiring reboot)
+- `engine.connect()` and `engine.disconnect()` have undocumented side effects
+- ObjC exceptions from CoreAudio cannot be caught by Swift `do/catch`
+- The simulator has different audio behaviour from real hardware
+
+When hitting an audio issue, the process should be:
+1. Add comprehensive logging (the `alog()` function writes to Documents/spectrum.log)
+2. Capture the exact error and state from device logs
+3. Research the specific error on Apple Developer Forums, AudioKit issues, and Stack Overflow
+4. Design the fix based on documented behaviour, not guessing
+5. Test in the simulator first (where possible)
+6. Only deploy to device when confident
 
 ## Build
 
@@ -379,54 +471,54 @@ xcodebuild -project Spectrum.xcodeproj -scheme Spectrum \
   CODE_SIGNING_ALLOWED=NO 2>&1 | tail -5
 ```
 
-## Test
-
-```bash
-xcodebuild -project Spectrum.xcodeproj -scheme Spectrum \
-  -destination 'platform=iOS Simulator,name=iPhone 16' test \
-  CODE_SIGNING_ALLOWED=NO
-```
-
-### Test Architecture
-
-Pure decision logic is extracted as `internal static` methods so tests can call them directly without audio hardware or Metal devices:
-
-- **AudioEngine.mapToLogBands** — logarithmic frequency band mapping and dB normalisation (with configurable dB range)
-- **AudioEngine.applySmoothing** — exponential smoothing between frames
-- **AudioEngine.updatePeaks** — peak tracking with decay
-- **MetalRenderer.gradientColor** — frequency-to-colour gradient (blue→cyan→green→yellow→red)
-- **MetalRenderer.heatmapColor** — intensity-to-colour mapping for spectrogram
-
-Test target uses `PBXFileSystemSynchronizedRootGroup` (Xcode 16+) for auto-discovery of test files.
-
-### Test Coverage (46 tests)
-
-| Suite | Tests | Coverage |
-|-------|-------|----------|
-| AudioEngineTests | 21 | Log band mapping (boundary values, clamping, band count, frequency distribution, sample rate, custom dB range, narrow range detail), smoothing (factor=0, 0.5, 1, default, mismatched lengths), peak tracking (new peak, decay, floor at zero, multi-frame) |
-| MetalRendererTests | 15 | Gradient colour stops (blue, cyan, green, yellow, red), interpolation, alpha consistency, non-negative components, smooth transitions, heatmap stops (black, red), clamping, brightness ordering |
-| SpectrumDataTests | 10 | Enum cases/raw values/ordering, layout constants (band count, FFT power-of-2, NDC bounds, waveform below spectrum), coordinate conversion (edges, centre, inverted Y, scaling) |
-
 ## Frameworks Used
 
 - **Metal** + **MetalKit**: GPU-accelerated rendering
-- **AVFoundation**: Audio capture (AVAudioEngine)
+- **AVFoundation**: Audio capture (AVAudioEngine) and music file playback (AVAudioPlayerNode)
 - **Accelerate**: vDSP FFT and signal processing
+- **MediaPlayer**: MPMediaQuery for music library access and DRM filtering
 - **SwiftUI**: UI framework
 
 ## Future Roadmap
 
-- **Fundamental frequency detection / instrument tuner**: Identify the dominant pitch (e.g. autocorrelation or cepstral analysis on the FFT output) and display the nearest musical note with cents offset. Would enable use as a guitar/instrument tuner.
-- **Beat detection / BPM counter**: Detect rhythmic onsets via energy flux in the low-frequency bands, track inter-beat intervals, and display beats per minute. Could drive visual pulse effects synced to the beat.
+- **Fundamental frequency detection / instrument tuner**: Identify the dominant pitch (e.g. autocorrelation or cepstral analysis on the FFT output) and display the nearest musical note with cents offset.
+- **Beat detection / BPM counter**: Detect rhythmic onsets via energy flux in the low-frequency bands, track inter-beat intervals, and display beats per minute.
 
 ## Known Gotchas
 
-- **Metal/Swift struct alignment**: Metal `packed_float2`/`packed_float4` are 24 bytes but Swift's `SIMD2<Float>` + `SIMD4<Float>` is 32 bytes (SIMD4 has 16-byte alignment, adding 8 bytes of padding). Use non-packed `float2`/`float4` in Metal to match Swift's layout. Mismatched stride causes garbled rendering and GPU stalls from degenerate geometry.
-- **Audio session mode matters**: `.measurement` mode disables AGC, resulting in very quiet mic input. Use `.default` mode for maximum sensitivity in a visualiser.
-- **FFT normalisation**: Use `4/N²` not `1/N²` for one-sided power spectrum — the 4× factor accounts for the missing negative-frequency energy. Without it, levels are 6dB too low.
-- **Decouple audio and display rates**: Smoothing at the audio callback rate (~21fps) produces jerky animation. Move smoothing to the renderer's 60fps draw loop with asymmetric lerp (fast attack, slow decay) for professional-quality visuals.
-- `vDSP_ctoz` stride parameter (2) is measured in float-sized units, not DSPComplex struct units
-- `vDSP_vdbcon` requires non-zero input — floor magnitudes to 1e-20 before calling
-- MTKView on iOS uses CADisplayLink (main thread) — no threading concerns between SwiftUI updates and Metal draw calls
-- Circular mode needs aspect-ratio correction (multiply x offsets by 1/aspectRatio) to avoid elliptical distortion in portrait
-- Audio tap callback runs on audio thread — must dispatch to main thread before setting @Published properties
+### Audio Engine (Critical — Read Before Modifying)
+
+- **NEVER connect nodes after engine.start()**: Calling `engine.connect()` on a running engine stops it silently and permanently marks the playerNode as "disconnected". The only reliable sequence is: attach → connect → prepare → start. This was discovered through extensive debugging and confirmed by AudioKit issue #2527.
+- **NEVER disconnect nodes**: `engine.disconnectNodeOutput()` permanently breaks the node. Leave idle connections in place — they pass silence at zero cost. This is how AudioKit handles it.
+- **NEVER recreate AVAudioEngine**: Creating a fresh `AVAudioEngine()` mid-lifecycle causes 0 Hz formats and RPC timeout crashes (especially on the simulator).
+- **NEVER change audio session category after startup**: Switching between `.record` and `.playAndRecord` corrupts the hardware format.
+- **NEVER reconnect playerNode in playFile()**: The startup connection handles format conversion. Reconnecting while running crashes.
+- **Format validation before installTap**: Always check `sampleRate > 0` and `channelCount > 0`. Invalid formats throw ObjC `NSException` that Swift can't catch.
+- **engine.connect() stops the engine**: Even on a "running" engine, connecting nodes stops it. If you must connect at runtime (not recommended), check `engine.isRunning` afterward and restart.
+
+### Audio Session
+
+- **Use `.playAndRecord` for both mic and music on device**: No quality penalty — AGC is controlled by mode (`.default`), not category.
+- **Use `.playback` on simulator**: `.playAndRecord` fails because there's no mic hardware. Use `#if targetEnvironment(simulator)`.
+- **Don't access `engine.inputNode` on simulator**: It triggers the implicit graph creation which fails with no mic hardware.
+- **Don't call `setActive(false)`**: Corrupts hardware format.
+- **0 Hz format / 0 input channels**: Usually means the audio subsystem needs a phone reboot. The `audioHardwareBroken` flag triggers a UI alert.
+
+### DRM and Music Library
+
+- **`hasProtectedAsset`**: The reliable DRM check. Since 2024, iTunes Store purchases are DRM-free.
+- **`.movpkg` = unplayable**: Apple Music subscription tracks cached locally have `assetURL` with `.movpkg` extension, `cloud=false`, and `protected=false` — but `AVAudioFile` cannot open them (error 2003334207). Filter by URL extension.
+- **`AVAudioFile(forReading:)` unreliable for DRM**: Gives inconsistent results depending on audio session state. Removed from the scan filter (but useful as a diagnostic tool).
+- **Load library once**: Rescanning under different session states causes tracks to appear/disappear.
+
+### Metal/Swift
+
+- **Struct alignment**: Metal `packed_float2`/`packed_float4` are 24 bytes but Swift's `SIMD2<Float>` + `SIMD4<Float>` is 32 bytes. Use non-packed types in Metal.
+- **@Published kills FPS**: Don't use `@Published` on properties read by MetalRenderer at 60fps.
+
+### FFT
+
+- **Use `4/N²` normalisation**: Not `1/N²` — the 4× factor accounts for one-sided spectrum.
+- **`.default` mode for AGC**: `.measurement` mode disables gain control → very quiet mic input.
+- `vDSP_ctoz` stride is in float units, not struct units.
+- `vDSP_vdbcon` needs non-zero input — floor to 1e-20.

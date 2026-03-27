@@ -4,5 +4,7 @@
 <dict>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Spectrum needs microphone access to analyse audio frequencies in real time.</string>
+	<key>NSAppleMusicUsageDescription</key>
+	<string>Spectrum needs access to your music library to play and analyse tracks.</string>
 </dict>
 </plist>

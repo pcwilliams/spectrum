@@ -101,6 +101,16 @@ class MusicPlayer: ObservableObject {
             return true
         }
         print("🎵 Music library: \(eligible.count) playable, \(noUrl) no URL, \(drm) DRM, \(movpkg) movpkg (cached stream), out of \(query.count) total")
+        // Log track list to spectrum.log for automated testing
+        if let logPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.appendingPathComponent("spectrum.log"),
+           let handle = FileHandle(forWritingAtPath: logPath.path) {
+            handle.seekToEndOfFile()
+            for item in eligible {
+                let line = "TRACK: \(item.artist ?? "?") — \(item.title ?? "?")\n"
+                handle.write(line.data(using: .utf8)!)
+            }
+            handle.closeFile()
+        }
 
         // Group by artist, sorted case-insensitively
         var grouped: [String: [MPMediaItem]] = [:]

@@ -222,4 +222,84 @@ struct AudioEngineTests {
         }
         #expect(peaks[0] == 0.0)
     }
+
+    // MARK: - frequencyToNote
+
+    @Test func frequencyToNote_A4_returnsA4_zeroCents() {
+        let result = AudioEngine.frequencyToNote(440.0)
+        #expect(result.note == "A4")
+        #expect(abs(result.cents) < 1.0)
+    }
+
+    @Test func frequencyToNote_C4_returnsC4_nearZeroCents() {
+        // C4 = 261.626 Hz
+        let result = AudioEngine.frequencyToNote(261.626)
+        #expect(result.note == "C4")
+        #expect(abs(result.cents) < 1.0)
+    }
+
+    @Test func frequencyToNote_E4_returnsE4() {
+        // E4 = 329.628 Hz
+        let result = AudioEngine.frequencyToNote(329.628)
+        #expect(result.note == "E4")
+        #expect(abs(result.cents) < 1.0)
+    }
+
+    @Test func frequencyToNote_A3_returnsA3() {
+        // A3 = 220 Hz (one octave below A4)
+        let result = AudioEngine.frequencyToNote(220.0)
+        #expect(result.note == "A3")
+        #expect(abs(result.cents) < 1.0)
+    }
+
+    @Test func frequencyToNote_A5_returnsA5() {
+        // A5 = 880 Hz (one octave above A4)
+        let result = AudioEngine.frequencyToNote(880.0)
+        #expect(result.note == "A5")
+        #expect(abs(result.cents) < 1.0)
+    }
+
+    @Test func frequencyToNote_slightlySharp_positiveCents() {
+        // 10 cents sharp of A4: 440 * 2^(10/1200) ≈ 442.55
+        let result = AudioEngine.frequencyToNote(442.55)
+        #expect(result.note == "A4")
+        #expect(result.cents > 5 && result.cents < 15)
+    }
+
+    @Test func frequencyToNote_slightlyFlat_negativeCents() {
+        // 15 cents flat of A4: 440 * 2^(-15/1200) ≈ 436.19
+        let result = AudioEngine.frequencyToNote(436.19)
+        #expect(result.note == "A4")
+        #expect(result.cents < -10 && result.cents > -20)
+    }
+
+    @Test func frequencyToNote_lowFrequency_C2() {
+        // C2 = 65.406 Hz
+        let result = AudioEngine.frequencyToNote(65.406)
+        #expect(result.note == "C2")
+        #expect(abs(result.cents) < 1.0)
+    }
+
+    @Test func frequencyToNote_highFrequency_C7() {
+        // C7 = 2093.005 Hz
+        let result = AudioEngine.frequencyToNote(2093.005)
+        #expect(result.note == "C7")
+        #expect(abs(result.cents) < 1.0)
+    }
+
+    @Test func frequencyToNote_sharpNotes() {
+        // F#4 = 369.994 Hz
+        let result = AudioEngine.frequencyToNote(369.994)
+        #expect(result.note == "F♯4")
+        #expect(abs(result.cents) < 1.0)
+    }
+
+    @Test func frequencyToNote_centsRangeIsBounded() {
+        // Test various frequencies — cents should always be in [-50, 50]
+        let freqs: [Float] = [100, 200, 300, 400, 500, 1000, 2000]
+        for freq in freqs {
+            let result = AudioEngine.frequencyToNote(freq)
+            #expect(result.cents >= -50 && result.cents <= 50, "cents=\(result.cents) for freq=\(freq)")
+        }
+    }
 }

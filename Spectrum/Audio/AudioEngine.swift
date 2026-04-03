@@ -1,5 +1,6 @@
 import AVFoundation
 import Accelerate
+import QuartzCore
 
 // MARK: - Debug Logging
 //
@@ -51,6 +52,11 @@ private func alog(_ msg: String) {
 /// directly on the main thread (no @Published, no SwiftUI re-renders).
 class AudioEngine: ObservableObject {
     static var loggingEnabled = true
+    /// Enable verbose pitch/BPM detection logging (every frame). Off by default
+    /// to reduce log noise — enable via `-pitchlog` launch argument for debugging.
+    static var pitchLoggingEnabled = false
+    /// Enable verbose BPM detection logging. Off by default — enable via `-bpmlog` launch argument.
+    static var bpmLoggingEnabled = false
 
     // MARK: - Public Data (read directly by MetalRenderer, NOT @Published)
     //
@@ -118,12 +124,94 @@ class AudioEngine: ObservableObject {
     /// Highest allowed ceiling value — caps at 0 dB (full scale).
     private let maxCeiling: Float = 0
 
+    // MARK: - Pitch Detection (read by ContentView overlay, NOT @Published)
+
+    var detectedNote: String = ""      // e.g. "A4"
+    var detectedCents: Float = 0       // -50 to +50
+    var tuningEnabled: Bool = false {  // set by ContentView
+        didSet {
+            if tuningEnabled != oldValue {
+                pitchSmoothingBuffer.removeAll()
+                pitchMissCount = 0
+                detectedNote = ""
+                detectedCents = 0
+            }
+        }
+    }
+
+    // MARK: - BPM Detection (read by ContentView overlay and MetalRenderer)
+
+    var detectedBPM: Int? = nil        // nil = not confident
+    var beatFlash: Bool = false        // true briefly after each beat
+    var beatFlashCounter: Int = 0      // frames remaining, decremented by MetalRenderer
+    var bpmEnabled: Bool = false {     // set by ContentView
+        didSet {
+            if bpmEnabled != oldValue {
+                spectralFluxHistory.removeAll()
+                fluxWriteIndex = 0
+                fluxSampleCount = 0
+                recentLowEnergy = 0
+                lastBeatTime = 0
+                bpmUpdateCounter = 0
+                ossFirstTimestamp = 0
+                ossLastTimestamp = 0
+                bpmSmoothingBuffer.removeAll()
+                onsetPrevMags = nil
+                lastLockedBPM = 0
+                tempoChangeCount = 0
+                detectedBPM = nil
+                beatFlash = false
+                beatFlashCounter = 0
+            }
+        }
+    }
+
     // MARK: - Static Gain Boost (for simulator testing)
     //
     // Applied as a dB offset to FFT output, boosting quiet simulator audio
     // to exercise the full visualisation. Set via -gain <dB> launch argument.
 
     var staticGainDB: Float = 0
+
+    // MARK: - DSP Performance Tracking
+
+    private var dspTimingSum: Double = 0
+    private var dspTimingCount: Int = 0
+    private var dspTimingMax: Double = 0
+
+    // MARK: - Pitch Detection State
+
+    private var pitchSmoothingBuffer: [Float] = []
+    private let pitchSmoothingCount = 3   // median of last 3 detections (fast tracking)
+    private var pitchMissCount = 0        // consecutive frames with no pitch detected
+    private let pitchMissLimit = 5        // clear display after ~250ms of silence
+    private var lastLoggedPitch: String = "" // for change-only logging
+
+    // MARK: - BPM Detection State
+    //
+    // Uses autocorrelation of the onset strength signal (spectral flux) rather
+    // than inter-onset intervals. This handles syncopated rhythms (drum & bass,
+    // electronic music) because the overall rhythmic pattern repeats at the beat
+    // period even when individual kicks are syncopated (Scheirer 1998 / Ellis 2007).
+
+    private var spectralFluxHistory: [Float] = []
+    private let fluxHistorySize = 340     // ~8 seconds at ~43fps (hop=1024 at 44.1kHz)
+    private var fluxWriteIndex = 0
+    private var fluxSampleCount = 0       // total samples written (for fill tracking)
+    private var recentLowEnergy: Float = 0       // smoothed low energy for beat flash threshold
+    private var lastBeatTime: Double = 0
+    private var bpmUpdateCounter = 0             // only recompute autocorrelation every ~20 frames (~0.5s)
+    private var ossFirstTimestamp: Double = 0     // timestamp of first OSS sample (for rate calc)
+    private var ossLastTimestamp: Double = 0      // timestamp of most recent OSS sample
+    private var bpmSmoothingBuffer: [Int] = []   // recent BPM estimates for temporal smoothing
+    private let bpmSmoothingSize = 3             // need consensus over 3 estimates (~1.5s)
+    private var lastLockedBPM: Int = 0           // last displayed BPM, for tempo-change detection
+    private var tempoChangeCount = 0             // consecutive estimates diverging from locked BPM
+    // Onset-rate FFT resources (1024-point, separate from display FFT)
+    private var onsetFFTSetup: FFTSetup?
+    private let onsetFFTSize = 1024
+    private var onsetWindow: [Float] = []
+    private var onsetPrevMags: [Float]?          // previous frame magnitudes for spectral flux
 
     // MARK: - Playback State
 
@@ -137,6 +225,9 @@ class AudioEngine: ObservableObject {
     var onTrackFinished: (() -> Void)?
     /// Called when a track fails to open (e.g. DRM or corrupt file).
     var onPlaybackError: ((String) -> Void)?
+    /// Incremented on each stop/play to invalidate stale completion handlers.
+    /// Prevents a stopped track's async completion from clearing the new track.
+    private var playbackGeneration = 0
 
     // MARK: - Init / Deinit
 
@@ -150,11 +241,21 @@ class AudioEngine: ObservableObject {
 
         window = [Float](repeating: 0, count: fftSize)
         vDSP_hann_window(&window, vDSP_Length(fftSize), Int32(vDSP_HANN_NORM))
+
+        // Onset-rate FFT (1024-point) for higher-resolution BPM detection
+        let onsetLog2n = vDSP_Length(log2(Double(onsetFFTSize)))
+        onsetFFTSetup = vDSP_create_fftsetup(onsetLog2n, FFTRadix(kFFTRadix2))
+        onsetWindow = [Float](repeating: 0, count: onsetFFTSize)
+        vDSP_hann_window(&onsetWindow, vDSP_Length(onsetFFTSize), Int32(vDSP_HANN_NORM))
+
         alog("AudioEngine.init")
     }
 
     deinit {
         if let setup = fftSetup {
+            vDSP_destroy_fftsetup(setup)
+        }
+        if let setup = onsetFFTSetup {
             vDSP_destroy_fftsetup(setup)
         }
     }
@@ -182,10 +283,11 @@ class AudioEngine: ObservableObject {
             alog("Audio session: .playback (simulator)")
             #else
             // Device: .playAndRecord enables both mic and music output.
-            // .defaultToSpeaker routes music to the speaker (not earpiece).
+            // .defaultToSpeaker routes music to the speaker (not earpiece) when no Bluetooth connected.
+            // .allowBluetooth/.allowBluetoothA2DP respect connected Bluetooth headphones for output.
             // AGC quality is identical to .record when using .default mode.
-            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
-            alog("Audio session: .playAndRecord + .defaultToSpeaker")
+            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
+            alog("Audio session: .playAndRecord + .defaultToSpeaker + .allowBluetooth + .allowBluetoothA2DP")
             #endif
             try session.setActive(true)
             alog("  sampleRate=\(session.sampleRate), outputChannels=\(session.outputNumberOfChannels), inputChannels=\(session.inputNumberOfChannels)")
@@ -338,8 +440,8 @@ class AudioEngine: ObservableObject {
     /// Opens an audio file and begins playback through the music pipeline.
     /// Does NOT reconnect playerNode — the startup connection handles format
     /// conversion automatically. Reconnecting on a running engine would crash.
-    func playFile(url: URL) {
-        alog("USER ACTION: playFile url=\(url.lastPathComponent)")
+    func playFile(url: URL, startFrame: AVAudioFramePosition = 0) {
+        alog("USER ACTION: playFile url=\(url.lastPathComponent) startFrame=\(startFrame)")
         alog("  engine.isRunning=\(engine.isRunning), playerNode.isPlaying=\(playerNode.isPlaying)")
 
         guard isRunning, engine.isRunning else {
@@ -348,16 +450,33 @@ class AudioEngine: ObservableObject {
         }
 
         playerNode.stop()
+        playbackGeneration += 1
         tapBufferCount = 0
 
         do {
             let file = try AVAudioFile(forReading: url)
             currentAudioFile = file
-            alog("playFile: file opened — format=\(file.processingFormat.sampleRate)Hz, \(file.processingFormat.channelCount)ch, length=\(file.length)")
+            let generation = playbackGeneration
+            alog("playFile: file opened — format=\(file.processingFormat.sampleRate)Hz, \(file.processingFormat.channelCount)ch, length=\(file.length), gen=\(generation)")
 
-            playerNode.scheduleFile(file, at: nil) { [weak self] in
-                alog("playFile: scheduleFile completion fired")
-                DispatchQueue.main.async { self?.onTrackFinished?() }
+            let actualStart = min(startFrame, file.length - 1)
+            if actualStart > 0 {
+                let frameCount = AVAudioFrameCount(file.length - actualStart)
+                playerNode.scheduleSegment(file, startingFrame: actualStart, frameCount: frameCount, at: nil) { [weak self] in
+                    alog("playFile: completion fired (gen=\(generation))")
+                    DispatchQueue.main.async {
+                        guard let self, self.playbackGeneration == generation else { return }
+                        self.onTrackFinished?()
+                    }
+                }
+            } else {
+                playerNode.scheduleFile(file, at: nil) { [weak self] in
+                    alog("playFile: completion fired (gen=\(generation))")
+                    DispatchQueue.main.async {
+                        guard let self, self.playbackGeneration == generation else { return }
+                        self.onTrackFinished?()
+                    }
+                }
             }
             playerNode.play()
             alog("playFile: playerNode.play() called — isPlaying=\(playerNode.isPlaying)")
@@ -380,6 +499,10 @@ class AudioEngine: ObservableObject {
         alog("USER ACTION: pausePlayback")
         guard engine.isRunning else { return }
         playerNode.pause()
+        // Clear BPM display — no audio flowing means no beat to show
+        detectedBPM = nil
+        beatFlash = false
+        beatFlashCounter = 0
     }
 
     func resumePlayback() {
@@ -393,6 +516,7 @@ class AudioEngine: ObservableObject {
 
     func stopPlayback() {
         alog("USER ACTION: stopPlayback")
+        playbackGeneration += 1  // invalidate any pending completion handler
         playerNode.stop()
         currentAudioFile = nil
         resetDisplayState()
@@ -405,6 +529,27 @@ class AudioEngine: ObservableObject {
         let bc = bandCount
         spectrumData = [Float](repeating: 0, count: bc)
         waveformData = [Float](repeating: 0, count: SpectrumLayout.waveformSampleCount)
+        // Reset pitch detection
+        detectedNote = ""
+        detectedCents = 0
+        pitchSmoothingBuffer.removeAll()
+        pitchMissCount = 0
+        // Reset BPM detection
+        detectedBPM = nil
+        beatFlash = false
+        beatFlashCounter = 0
+        spectralFluxHistory.removeAll()
+        fluxWriteIndex = 0
+        recentLowEnergy = 0
+        lastBeatTime = 0
+        bpmUpdateCounter = 0
+        fluxSampleCount = 0
+        ossFirstTimestamp = 0
+        ossLastTimestamp = 0
+        bpmSmoothingBuffer.removeAll()
+        onsetPrevMags = nil
+        lastLockedBPM = 0
+        tempoChangeCount = 0
     }
 
     // MARK: - FFT Processing
@@ -414,6 +559,7 @@ class AudioEngine: ObservableObject {
     // auto-level → logarithmic band mapping → normalise to 0–1
 
     private func processBuffer(_ buffer: AVAudioPCMBuffer) {
+        let dspStart = CACurrentMediaTime()
         tapBufferCount += 1
         if tapBufferCount <= 3 || tapBufferCount % 100 == 0 {
             alog("processBuffer #\(tapBufferCount): frameLength=\(buffer.frameLength), source=\(audioSource)")
@@ -511,11 +657,98 @@ class AudioEngine: ObservableObject {
                 let power = isMusic ? AudioEngine.musicTiltPower : Float(1)
                 let spectrum = AudioEngine.mapToLogBands(dbMags, bandCount: self.bandCount, fftSize: self.fftSize, sampleRate: self.sampleRate, dbFloor: dbFloor, dbCeiling: dbCeiling, spectralTilt: tilt, tiltPower: power)
 
+                // Pitch detection (if enabled)
+                var pitchNote = ""
+                var pitchCents: Float = 0
+                if self.tuningEnabled {
+                    if let freq = self.detectPitch(samples: channelData, sampleCount: sampleCount) {
+                        self.pitchMissCount = 0
+
+                        // If pitch jumps by more than a semitone from the current median,
+                        // flush the buffer — the user has changed notes
+                        if !self.pitchSmoothingBuffer.isEmpty {
+                            let sorted = self.pitchSmoothingBuffer.sorted()
+                            let currentMedian = sorted[sorted.count / 2]
+                            let semitoneDistance = abs(12.0 * log2(freq / currentMedian))
+                            if semitoneDistance > 1.0 {
+                                self.pitchSmoothingBuffer.removeAll()
+                            }
+                        }
+
+                        self.pitchSmoothingBuffer.append(freq)
+                        if self.pitchSmoothingBuffer.count > self.pitchSmoothingCount {
+                            self.pitchSmoothingBuffer.removeFirst()
+                        }
+                        let sorted = self.pitchSmoothingBuffer.sorted()
+                        let medianFreq = sorted[sorted.count / 2]
+                        let result = AudioEngine.frequencyToNote(medianFreq)
+                        pitchNote = result.note
+                        pitchCents = result.cents
+                    } else {
+                        // No pitch detected — clear display after several consecutive misses
+                        self.pitchMissCount += 1
+                        if self.pitchMissCount >= self.pitchMissLimit {
+                            self.pitchSmoothingBuffer.removeAll()
+                        } else if !self.pitchSmoothingBuffer.isEmpty {
+                            // Hold the last detected pitch briefly during short gaps
+                            let sorted = self.pitchSmoothingBuffer.sorted()
+                            let medianFreq = sorted[sorted.count / 2]
+                            let result = AudioEngine.frequencyToNote(medianFreq)
+                            pitchNote = result.note
+                            pitchCents = result.cents
+                        }
+                    }
+
+                    // Log pitch changes (not every frame)
+                    let pitchLabel = pitchNote.isEmpty ? "--" : "\(pitchNote) \(String(format: "%+.0f", pitchCents))c"
+                    if pitchLabel != self.lastLoggedPitch {
+                        if AudioEngine.pitchLoggingEnabled { alog("PITCH: \(pitchLabel)") }
+                        self.lastLoggedPitch = pitchLabel
+                    }
+                }
+
+                // BPM detection (if enabled) — compute multiple onset FFTs per
+                // callback for ~43fps onset rate (hop=1024, vs ~10fps with hop=4410).
+                // Uses a separate 1024-point FFT for onset detection only.
+                var bpm: Int? = nil
+                var isBeat = false
+                if self.bpmEnabled, let onsetSetup = self.onsetFFTSetup {
+                    let hopSize = self.onsetFFTSize  // 1024
+                    let baseTimestamp = CACurrentMediaTime()
+                    let secondsPerSample = 1.0 / Double(self.sampleRate)
+                    var offset = 0
+                    while offset + self.onsetFFTSize <= frameCount {
+                        let hopTimestamp = baseTimestamp + Double(offset) * secondsPerSample
+                        let onsetResult = self.computeOnsetAndDetectBPM(
+                            channelData: channelData, offset: offset,
+                            fftSetup: onsetSetup, timestamp: hopTimestamp)
+                        if onsetResult.bpm != nil { bpm = onsetResult.bpm }
+                        if onsetResult.isBeat { isBeat = true }
+                        offset += hopSize
+                    }
+                }
+
+                // DSP performance measurement
+                let dspElapsed = CACurrentMediaTime() - dspStart
+                self.dspTimingSum += dspElapsed
+                self.dspTimingCount += 1
+                if dspElapsed > self.dspTimingMax { self.dspTimingMax = dspElapsed }
+                if self.dspTimingCount % 100 == 0 {
+                    let avgMs = (self.dspTimingSum / Double(self.dspTimingCount)) * 1000
+                    let maxMs = self.dspTimingMax * 1000
+                    let budgetMs = Double(self.fftSize) / Double(self.sampleRate) * 1000
+                    alog("DSP PERF: avg=\(String(format: "%.2f", avgMs))ms, max=\(String(format: "%.2f", maxMs))ms, budget=\(String(format: "%.1f", budgetMs))ms (tuning=\(self.tuningEnabled), bpm=\(self.bpmEnabled))")
+                }
+
                 // Capture values for main-thread dispatch (Swift concurrency requires
                 // copying mutable vars to let before crossing actor boundaries)
                 let finalSpectrum = spectrum
                 let publishedFloor = dbFloor
                 let publishedCeiling = dbCeiling
+                let finalNote = pitchNote
+                let finalCents = pitchCents
+                let finalBPM = bpm
+                let finalIsBeat = isBeat
 
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
@@ -523,9 +756,422 @@ class AudioEngine: ObservableObject {
                     self.waveformData = waveform
                     self.dbFloor = publishedFloor
                     self.dbCeiling = publishedCeiling
+                    self.detectedNote = finalNote
+                    self.detectedCents = finalCents
+                    self.detectedBPM = finalBPM
+                    if finalIsBeat {
+                        self.beatFlash = true
+                        self.beatFlashCounter = 6  // ~100ms at 60fps
+                    }
                 }
             }
         }
+    }
+
+    // MARK: - Pitch Detection
+
+    /// Time-domain autocorrelation pitch detection.
+    /// Computes autocorrelation directly from audio samples using vDSP_dotpr,
+    /// which is far more reliable for voice and instruments than the
+    /// frequency-domain approach (IFFT of power spectrum exaggerates harmonics).
+    /// Searches for the first significant peak in the musical range (65Hz–2000Hz).
+    private func detectPitch(samples: UnsafePointer<Float>, sampleCount: Int) -> Float? {
+        let n = min(sampleCount, fftSize)
+
+        // Lag range for musical pitches (C2 65Hz to B5 988Hz)
+        let minLag = max(2, Int(sampleRate / 1000))    // 1000 Hz — skips noisy short-lag region
+        let maxLag = min(Int(sampleRate / 65), n / 2)  // 65 Hz (or half buffer)
+        guard minLag < maxLag else { return nil }
+
+        // Compute normalised autocorrelation for each lag in the musical range.
+        // Uses Pearson correlation (normalise by overlapping segment energies)
+        // to eliminate the short-lag bias that causes false detections in noise.
+        var acf = [Float](repeating: 0, count: maxLag + 1)
+
+        // Seed segment energies for the first lag
+        var energyL: Float = 0  // energy of x[0..<n-lag]
+        var energyR: Float = 0  // energy of x[lag..<n]
+        vDSP_dotpr(samples, 1, samples, 1, &energyL, vDSP_Length(n - minLag))
+        vDSP_dotpr(samples + minLag, 1, samples + minLag, 1, &energyR, vDSP_Length(n - minLag))
+
+        for lag in minLag...maxLag {
+            var dot: Float = 0
+            vDSP_dotpr(samples, 1, samples + lag, 1, &dot, vDSP_Length(n - lag))
+
+            let denom = sqrtf(energyL * energyR)
+            acf[lag] = denom > 0 ? dot / denom : 0
+
+            // Incrementally update segment energies for next lag
+            if lag < maxLag {
+                let dropL = samples[n - lag - 1]
+                energyL -= dropL * dropL
+                let dropR = samples[lag]
+                energyR -= dropR * dropR
+            }
+        }
+
+        // Find the first peak above threshold, scanning from short to long lags.
+        // Find the first autocorrelation peak above threshold, scanning from
+        // short lags (high freq) to long lags (low freq). With Pearson normalisation
+        // and minLag at 1000Hz, noise is bounded well below 0.75.
+        var bestLag = minLag
+        var bestVal: Float = 0
+        var rising = false
+
+        for lag in minLag...maxLag {
+            if acf[lag] > bestVal {
+                bestVal = acf[lag]
+                bestLag = lag
+                rising = true
+            } else if rising && bestVal > 0.75 {
+                // Found a peak above threshold — this is the fundamental
+                break
+            } else if rising && acf[lag] < bestVal * 0.7 {
+                // Peak fell away but wasn't strong enough — reset for next peak
+                rising = false
+                bestVal = 0
+            }
+        }
+
+        // Confidence threshold — voice 0.93+, instruments 0.8+, noise <0.7
+        if self.tapBufferCount % 20 == 0 {
+            let candidateFreq = bestLag > 0 ? sampleRate / Float(bestLag) : 0
+            if AudioEngine.pitchLoggingEnabled {
+                alog("PITCH DBG: acPeak=\(String(format: "%.3f", bestVal)) lag=\(bestLag) freq=\(String(format: "%.1f", candidateFreq))Hz")
+            }
+        }
+        guard bestVal > 0.75 else { return nil }
+
+        // Parabolic interpolation for sub-sample accuracy
+        guard bestLag > minLag && bestLag < maxLag else { return nil }
+        let a = acf[bestLag - 1]
+        let b = acf[bestLag]
+        let c = acf[bestLag + 1]
+        let denom = a - 2 * b + c
+        let delta: Float = (denom != 0) ? 0.5 * (a - c) / denom : 0
+        let refinedLag = Float(bestLag) + delta
+
+        guard refinedLag > 0 else { return nil }
+        return sampleRate / refinedLag
+    }
+
+    /// Converts a frequency to the nearest musical note name and cents offset from A4=440Hz.
+    static func frequencyToNote(_ freq: Float) -> (note: String, cents: Float) {
+        let noteNames = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"]
+        let semitones = 12.0 * log2(freq / 440.0)
+        let roundedSemitones = roundf(semitones)
+        let cents = (semitones - roundedSemitones) * 100.0
+
+        // A4 is MIDI note 69
+        let midiNote = Int(roundedSemitones) + 69
+        let noteIndex = ((midiNote % 12) + 12) % 12
+        let octave = (midiNote / 12) - 1
+
+        return ("\(noteNames[noteIndex])\(octave)", cents)
+    }
+
+    // MARK: - BPM Detection
+
+    /// Compute a 1024-point onset FFT at the given offset and feed the result
+    /// into the BPM detector. Called multiple times per audio callback (hop=1024)
+    /// to achieve ~43fps onset rate.
+    private func computeOnsetAndDetectBPM(
+        channelData: UnsafePointer<Float>, offset: Int,
+        fftSetup: FFTSetup, timestamp: Double
+    ) -> (bpm: Int?, isBeat: Bool) {
+        let n = onsetFFTSize
+        let halfN = n / 2
+
+        // Window the samples
+        var windowed = [Float](repeating: 0, count: n)
+        for i in 0..<n {
+            windowed[i] = channelData[offset + i] * onsetWindow[i]
+        }
+
+        // FFT → magnitudes (linear, not dB)
+        var realp = [Float](repeating: 0, count: halfN)
+        var imagp = [Float](repeating: 0, count: halfN)
+        var mags = [Float](repeating: 0, count: halfN)
+
+        windowed.withUnsafeBufferPointer { dataBuf in
+            dataBuf.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: halfN) { ptr in
+                var split = DSPSplitComplex(realp: &realp, imagp: &imagp)
+                vDSP_ctoz(ptr, 2, &split, 1, vDSP_Length(halfN))
+                let log2n = vDSP_Length(log2(Double(n)))
+                vDSP_fft_zrip(fftSetup, &split, 1, log2n, FFTDirection(kFFTDirection_Forward))
+                vDSP_zvmags(&split, 1, &mags, 1, vDSP_Length(halfN))
+            }
+        }
+        // Sqrt to get magnitude (zvmags gives squared magnitudes)
+        var magCount = Int32(halfN)
+        vvsqrtf(&mags, mags, &magCount)
+
+        // Spectral flux: sum of positive magnitude increases across all bins
+        // (broadband — captures kicks, snares, and hi-hats for better rhythm detection)
+        var flux: Float = 0
+        if let prev = onsetPrevMags {
+            for i in 1..<halfN {
+                let diff = mags[i] - prev[i]
+                if diff > 0 { flux += diff }
+            }
+        }
+        onsetPrevMags = mags
+
+        // Feed flux into BPM detector
+        return detectBPM(flux: flux, timestamp: timestamp)
+    }
+
+    /// BPM detection via autocorrelation of the onset strength signal.
+    ///
+    /// Accepts a pre-computed spectral flux value (from the onset FFT).
+    /// The flux is log-compressed before storing. The autocorrelation uses
+    /// detrending (subtract 2s local mean) and normalisation for robust
+    /// detection. Harmonic checking at L/2 resolves octave ambiguity.
+    private func detectBPM(flux: Float, timestamp: Double) -> (bpm: Int?, isBeat: Bool) {
+        // Log compress the flux before storing — compresses dynamic range so
+        // quiet hi-hat onsets become comparable to loud kick drums, preventing
+        // a few loud beats from dominating the autocorrelation.
+        let compressedFlux = log(1.0 + 10.0 * flux)
+
+        // Smoothed energy for beat flash threshold
+        let smoothingAlpha: Float = 0.05
+        recentLowEnergy = recentLowEnergy * (1 - smoothingAlpha) + compressedFlux * smoothingAlpha
+
+        // Store compressed flux in circular buffer and track timing
+        if spectralFluxHistory.count < fluxHistorySize {
+            spectralFluxHistory.append(compressedFlux)
+        } else {
+            spectralFluxHistory[fluxWriteIndex] = compressedFlux
+        }
+        fluxWriteIndex = (fluxWriteIndex + 1) % fluxHistorySize
+        fluxSampleCount += 1
+        if ossFirstTimestamp == 0 { ossFirstTimestamp = timestamp }
+        ossLastTimestamp = timestamp
+
+        // Beat flash: simple threshold on compressed flux
+        var isBeat = false
+        if spectralFluxHistory.count >= 20 {
+            let count = Float(spectralFluxHistory.count)
+            let mean = spectralFluxHistory.reduce(0, +) / count
+            let variance = spectralFluxHistory.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / count
+            let threshold = mean + 1.5 * sqrt(variance)
+            if compressedFlux > threshold && compressedFlux > 0.1 && (timestamp - lastBeatTime) > (60.0 / 220.0) {
+                isBeat = true
+                lastBeatTime = timestamp
+            }
+        }
+
+        // Need at least ~2 seconds of data before attempting BPM
+        let minSamples = 86  // ~2s at ~43fps
+        guard spectralFluxHistory.count >= minSamples else { return (nil, isBeat) }
+
+        // Only recompute autocorrelation every ~20 frames (~0.5s at 43fps)
+        bpmUpdateCounter += 1
+        guard bpmUpdateCounter % 20 == 0 else {
+            return (detectedBPM, isBeat)
+        }
+
+        // --- Autocorrelation of the onset strength signal ---
+        // Linearise the circular buffer
+        let n = spectralFluxHistory.count
+        var oss = [Float](repeating: 0, count: n)
+        for i in 0..<n {
+            oss[i] = spectralFluxHistory[(fluxWriteIndex + i) % n]
+        }
+
+        // Compute variance of raw flux BEFORE detrending — this measures whether
+        // the spectral content is actually changing (beats present) vs steady state.
+        // Steady tones have near-zero flux variance; rhythmic music has high variance.
+        var rawMean: Float = 0
+        vDSP_meanv(oss, 1, &rawMean, vDSP_Length(n))
+        var rawVariance: Float = 0
+        for i in 0..<n {
+            let d = oss[i] - rawMean
+            rawVariance += d * d
+        }
+        rawVariance /= Float(n)
+
+        // Detrend: subtract 2-second local mean to remove slow energy variations.
+        // This eliminates false autocorrelation during quiet passages where the
+        // DC component of the onset signal produces positive correlation at all lags.
+        let elapsed = ossLastTimestamp - ossFirstTimestamp
+        guard elapsed > 1.0 else { return (nil, isBeat) }
+        let ossRate = Double(fluxSampleCount - 1) / elapsed
+        let detrendWindow = max(1, Int(ossRate * 2.0))  // 2 seconds
+        for i in 0..<n {
+            let start = max(0, i - detrendWindow / 2)
+            let end = min(n, i + detrendWindow / 2 + 1)
+            var localMean: Float = 0
+            for j in start..<end { localMean += oss[j] }
+            localMean /= Float(end - start)
+            oss[i] = max(0, oss[i] - localMean)  // half-wave rectify after detrending
+        }
+
+        // Normalise to unit variance (makes confidence threshold meaningful)
+        var ossMean: Float = 0
+        var ossStd: Float = 0
+        vDSP_normalize(oss, 1, &oss, 1, &ossMean, &ossStd, vDSP_Length(n))
+        // If stddev is near zero (silence), no rhythm to detect
+        guard ossStd > 1e-6 else {
+            bpmSmoothingBuffer.removeAll()
+            return (nil, isBeat)
+        }
+
+        // Compute autocorrelation for lags in the 80–160 BPM range.
+        // This covers the vast majority of popular music. The auto-halve/double
+        // below handles tempos outside this range.
+        let minLag = max(3, Int(ossRate * 60.0 / 160.0))  // 160 BPM
+        let maxLag = min(n / 2, Int(ceil(ossRate * 60.0 / 80.0)))  // 80 BPM
+
+        guard maxLag > minLag + 1 else { return (nil, isBeat) }
+
+        var acValues = [Float](repeating: 0, count: maxLag + 1)
+        for lag in minLag...maxLag {
+            var acValue: Float = 0
+            let overlapLength = vDSP_Length(n - lag)
+            vDSP_dotpr(oss, 1, Array(oss[lag...]), 1, &acValue, overlapLength)
+            acValues[lag] = acValue / Float(n - lag)
+        }
+
+        // Find the peak lag
+        var bestLag = minLag
+        for lag in (minLag + 1)...maxLag {
+            if acValues[lag] > acValues[bestLag] {
+                bestLag = lag
+            }
+        }
+
+        guard acValues[bestLag] > 0 else { return (nil, isBeat) }
+
+        // --- Harmonic check: resolve octave ambiguity ---
+        // If half-lag (double tempo) has a meaningful peak, prefer it.
+        // For periodic signals, the autocorrelation at 2*period is always >= at period,
+        // so the slow-tempo peak usually wins without this correction.
+        // Compute AC at half-lag even if outside the normal search range,
+        // since the double-tempo may exceed the BPM ceiling (e.g. 85→170 BPM).
+        let halfLag = bestLag / 2
+        if halfLag >= 3 && halfLag < n / 2 {
+            let searchLo = max(3, halfLag - 1)
+            let searchHi = min(n / 2 - 1, halfLag + 1)
+            if searchLo <= searchHi {
+                // Compute AC at half-lag candidates (may be outside acValues range)
+                var bestHalfLag = searchLo
+                var bestHalfAC: Float = -1
+                for candidateHalf in searchLo...searchHi {
+                    var ac: Float = 0
+                    if candidateHalf < acValues.count && acValues[candidateHalf] != 0 {
+                        ac = acValues[candidateHalf]
+                    } else {
+                        // Compute on the fly for lags outside the search range
+                        let overlapLen = vDSP_Length(n - candidateHalf)
+                        vDSP_dotpr(oss, 1, Array(oss[candidateHalf...]), 1, &ac, overlapLen)
+                        ac /= Float(n - candidateHalf)
+                    }
+                    if ac > bestHalfAC {
+                        bestHalfAC = ac
+                        bestHalfLag = candidateHalf
+                    }
+                }
+                // Only prefer the half-lag if its BPM falls within the displayable
+                // range (70-160). Otherwise the auto-halve will produce a wrong value.
+                let halfBPM = Int(round(60.0 * ossRate / Double(bestHalfLag)))
+                if bestHalfAC > 0.40 * acValues[bestLag] && halfBPM <= 160 {
+                    bestLag = bestHalfLag
+                }
+            }
+        }
+
+        // Parabolic interpolation around the peak for sub-lag accuracy
+        var refinedLag = Double(bestLag)
+        if bestLag > minLag && bestLag < maxLag {
+            let a = acValues[bestLag - 1]
+            let b = acValues[bestLag]
+            let g = acValues[bestLag + 1]
+            let denom = a - 2.0 * b + g
+            if abs(denom) > 1e-10 {
+                let p = Double(0.5 * (a - g) / denom)
+                refinedLag = Double(bestLag) + p
+            }
+        }
+
+        // Convert refined lag to BPM
+        var estimatedBPM = Int(round(60.0 * ossRate / refinedLag))
+
+        // Clamp to displayable range. Auto-halve above 160, auto-double below 70.
+        while estimatedBPM > 160 { estimatedBPM /= 2 }
+        while estimatedBPM < 70 { estimatedBPM *= 2 }
+
+        // Confidence: ratio of peak AC to zero-lag AC (after normalisation)
+        var zeroLagAC: Float = 0
+        vDSP_dotpr(oss, 1, oss, 1, &zeroLagAC, vDSP_Length(n))
+        zeroLagAC /= Float(n)
+        let confidence = zeroLagAC > 0 ? acValues[bestLag] / zeroLagAC : 0
+
+        if Self.bpmLoggingEnabled {
+            alog("BPM EST: bpm=\(estimatedBPM) lag=\(bestLag) refinedLag=\(String(format: "%.2f", refinedLag)) confidence=\(String(format: "%.0f", confidence * 100))% rawVar=\(String(format: "%.2f", rawVariance)) ossRate=\(String(format: "%.1f", ossRate)) samples=\(n)")
+        }
+
+        // Suppress when flux has very low variance (no rhythmic content).
+        // Steady tones, silence, and ambient noise all produce near-zero flux variance.
+        guard rawVariance > 0.5 else {
+            bpmSmoothingBuffer.removeAll()
+            return (nil, isBeat)
+        }
+
+        // Require meaningful correlation
+        guard confidence > 0.15 else {
+            bpmSmoothingBuffer.removeAll()
+            return (nil, isBeat)
+        }
+        guard estimatedBPM >= 80 && estimatedBPM <= 200 else {
+            bpmSmoothingBuffer.removeAll()
+            return (nil, isBeat)
+        }
+
+        // --- Tempo-change detection ---
+        // If the new estimate consistently diverges from the locked BPM,
+        // flush all state and restart. This handles track changes, section
+        // transitions, and corrects initial wrong locks — without requiring
+        // the user to toggle BPM off and on.
+        if lastLockedBPM > 0 && abs(estimatedBPM - lastLockedBPM) > 10 {
+            tempoChangeCount += 1
+            if tempoChangeCount >= 3 {
+                // Sustained divergence — flush and restart
+                if Self.bpmLoggingEnabled {
+                    alog("BPM CHANGE: \(lastLockedBPM) → \(estimatedBPM) (flushing after \(tempoChangeCount) divergent estimates)")
+                }
+                spectralFluxHistory.removeAll()
+                fluxWriteIndex = 0
+                fluxSampleCount = 0
+                ossFirstTimestamp = 0
+                ossLastTimestamp = 0
+                bpmSmoothingBuffer.removeAll()
+                onsetPrevMags = nil
+                lastLockedBPM = 0
+                tempoChangeCount = 0
+                return (nil, isBeat)
+            }
+        } else {
+            tempoChangeCount = 0
+        }
+
+        // Temporal smoothing: require consensus over 3 estimates
+        bpmSmoothingBuffer.append(estimatedBPM)
+        if bpmSmoothingBuffer.count > bpmSmoothingSize {
+            bpmSmoothingBuffer.removeFirst()
+        }
+
+        guard bpmSmoothingBuffer.count >= bpmSmoothingSize else {
+            return (detectedBPM, isBeat)
+        }
+        let median = bpmSmoothingBuffer.sorted()[bpmSmoothingSize / 2]
+        let nearMedian = bpmSmoothingBuffer.filter { abs($0 - median) <= 5 }.count
+        guard nearMedian >= bpmSmoothingSize - 1 else {
+            return (detectedBPM, isBeat)
+        }
+
+        lastLockedBPM = median
+        return (median, isBeat)
     }
 
     // MARK: - Static Helpers (extracted for testability)

@@ -6,13 +6,15 @@ struct SpectrumDataTests {
 
     // MARK: - VisualizationMode
 
-    @Test func visualizationMode_hasFourCases() {
-        #expect(VisualizationMode.allCases.count == 4)
+    @Test func visualizationMode_hasSixCases() {
+        #expect(VisualizationMode.allCases.count == 6)
     }
 
     @Test func visualizationMode_rawValues() {
         #expect(VisualizationMode.bars.rawValue == "Bars")
         #expect(VisualizationMode.curve.rawValue == "Curve")
+        #expect(VisualizationMode.surface.rawValue == "Surface")
+        #expect(VisualizationMode.surfaceLines.rawValue == "Surface+")
         #expect(VisualizationMode.circular.rawValue == "Circular")
         #expect(VisualizationMode.spectrogram.rawValue == "Spectrogram")
     }
@@ -21,8 +23,10 @@ struct SpectrumDataTests {
         let cases = VisualizationMode.allCases
         #expect(cases[0] == .bars)
         #expect(cases[1] == .curve)
-        #expect(cases[2] == .circular)
-        #expect(cases[3] == .spectrogram)
+        #expect(cases[2] == .surface)
+        #expect(cases[3] == .surfaceLines)
+        #expect(cases[4] == .circular)
+        #expect(cases[5] == .spectrogram)
     }
 
     // MARK: - SpectrumLayout constants

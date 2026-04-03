@@ -24,6 +24,7 @@ struct SpectrumMetalView: UIViewRepresentable {
         mtkView.enableSetNeedsDisplay = false  // Continuous rendering via CADisplayLink
         mtkView.isPaused = false
         mtkView.backgroundColor = UIColor(red: 0.04, green: 0.04, blue: 0.08, alpha: 1.0)
+        mtkView.depthStencilPixelFormat = .depth32Float  // needed for 3D surface mode
 
         if let renderer = MetalRenderer(mtkView: mtkView) {
             renderer.audioEngine = audioEngine

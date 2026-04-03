@@ -12,50 +12,9 @@ struct MusicBrowserView: View {
     var onTrackSelected: (MPMediaItem) -> Void
     var onClose: () -> Void
 
-    @State private var dragOffset: CGFloat = 0
 
     var body: some View {
         VStack(spacing: 0) {
-            // Drag handle + header
-            VStack(spacing: 6) {
-                Capsule()
-                    .fill(Color.white.opacity(0.3))
-                    .frame(width: 36, height: 4)
-                    .padding(.top, 8)
-
-                HStack {
-                    Text("Music Library")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundColor(.white)
-                    Spacer()
-                    Button {
-                        onClose()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 22))
-                            .foregroundColor(.white.opacity(0.5))
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 6)
-            }
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture()
-                    .onChanged { value in
-                        // Only allow downward drag
-                        dragOffset = max(0, value.translation.height)
-                    }
-                    .onEnded { value in
-                        if value.translation.height > 80 || value.velocity.height > 500 {
-                            onClose()
-                        }
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            dragOffset = 0
-                        }
-                    }
-            )
-
             Divider().background(Color.white.opacity(0.1))
 
             // Content
@@ -87,7 +46,6 @@ struct MusicBrowserView: View {
                 .foregroundColor(.white.opacity(0.15)),
             alignment: .top
         )
-        .offset(y: dragOffset)
     }
 
     private func unavailableView(icon: String, title: String, message: String) -> some View {

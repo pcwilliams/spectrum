@@ -6,12 +6,14 @@ enum AudioSource: String, CaseIterable {
     case music = "Music"
 }
 
-/// The four GPU-rendered visualisation modes.
+/// The five GPU-rendered visualisation modes.
 /// All share the same Metal pipeline — the CPU builds different vertex
 /// geometry for each mode, but the shaders are identical.
 enum VisualizationMode: String, CaseIterable {
     case bars = "Bars"
     case curve = "Curve"
+    case surface = "Surface"
+    case surfaceLines = "Surface+"
     case circular = "Circular"
     case spectrogram = "Spectrogram"
 }

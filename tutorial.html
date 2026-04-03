@@ -485,5 +485,174 @@
             The exponential tilt formula is: <code>boost = rate × octaves_above_ref<sup>power</sup></code>. With rate=5.0 and power=1.4, the curve is sublinear near the reference (gentle at 500Hz–2kHz) but superlinear far from it (aggressive at 8kHz–20kHz). This matches the empirical observation that music's spectral rolloff isn't constant — it steepens above ~3kHz as harmonic content thins out. The key insight was applying the boost only above the reference, not symmetrically — the symmetric version was cutting bass by 100+dB at 30Hz, completely destroying the low end.
         </div>
     </div>
+
+    <div class="step">
+        <span class="step-number">17</span>
+        <h2 class="step-title">Tuning, BPM, and Persistent Settings</h2>
+
+        <div class="prompt">
+            It's been working well these last few days! I have 3 new requests. Could we add persistent storage for the mode switch, a tuning mode that finds the fundamental frequency and shows it as a musical note with cents offset, and a BPM detector that looks for the drum beat? For tuning and BPM, I'd love on-screen displays overlaid on the bars.
+        </div>
+
+        <div class="response">
+            Three features were designed together: <code>@AppStorage</code> persistence for all UI toggles, autocorrelation-based pitch detection, and spectral flux onset detection for BPM.
+            <br><br>
+            The first pitch detection approach used the Wiener-Khinchin theorem: since the autocorrelation of a signal equals the inverse Fourier transform of its power spectral density, the existing FFT power spectrum could be reused — just one additional inverse FFT call with <code>kFFTDirection_Inverse</code>. Parabolic interpolation around the peak gave sub-Hz accuracy, and a median filter over 5 detections removed jitter. The frequency was converted to the nearest musical note via <code>12*log2(freq/440)</code>, with the remainder expressed as cents. In the simulator with a clean 440Hz test tone, it locked onto A4 perfectly.
+            <br><br>
+            Then it was deployed to a real phone. With voice input, the detected pitch was wildly unstable — jumping between octaves every frame. Device logs showed the problem clearly: squaring the power spectrum (which the Wiener-Khinchin approach requires) exaggerates harmonics relative to the fundamental. For a pure sine wave this is fine, but a human voice has strong overtones that compete with — and often exceed — the fundamental after squaring.
+            <br><br>
+            The fix was to switch to time-domain autocorrelation using <code>vDSP_dotpr</code> on the raw audio samples, bypassing the power spectrum entirely. This was fundamentally more reliable for complex signals because it preserves the natural amplitude relationships between harmonics. But a new problem appeared: noise at short lags (corresponding to high frequencies) produced false detections. The standard energy normalisation was biased because at short lags, nearly all samples overlap — giving artificially high correlation values.
+            <br><br>
+            The solution was Pearson normalisation: instead of dividing by the total signal energy, each lag is normalised by the geometric mean of the energies of just the overlapping segments at that lag. This eliminates the short-lag bias completely. Incremental energy updates (subtracting the sample that leaves the window, adding the one that enters) keep the per-lag normalisation at O(1) rather than O(N).
+            <br><br>
+            Even with correct normalisation, the threshold for "confident detection" needed iterative tuning — done by sending device logs back and forth. The <code>acPeak</code> value (peak autocorrelation after normalisation) was logged for every frame. Singing into the phone at various pitches, the logs showed: speech hovered around 0.3-0.5, clear singing reached 0.6-0.8, and noise floor was below 0.2. The threshold was walked up from 0.25 (too many false positives on speech) to 0.5 (still flickering) to 0.6 (better but caught breath sounds) to 0.75 (clean detections only on sustained notes). The search range was also narrowed from 2000Hz to 1000Hz to skip the problematic very-short-lag region entirely.
+            <br><br>
+            For BPM detection, frame-to-frame energy changes in the low-frequency bands (20-200Hz, where kick drums live) create an "onset strength" signal. Peaks above an adaptive threshold (mean + 1.5 sigma) are tracked as beat onsets. The median inter-onset interval gives the tempo, but it's only displayed when confidence is high (>50% of intervals cluster within 20% of the median).
+            <br><br>
+            The mode picker was changed from a segmented text control to icon buttons (the text was getting truncated with the new toggle buttons), and long-press tooltips were added to all toolbar buttons for discoverability.
+        </div>
+
+        <div class="outcome">
+            All three features working, but the pitch detection journey was a reminder that simulator testing can only take you so far. The Wiener-Khinchin approach was mathematically elegant and worked flawlessly with synthetic test tones — but real-world audio from a phone microphone is a different beast entirely. The final time-domain autocorrelation with Pearson normalisation is less elegant but fundamentally more robust.
+            <br><br>
+            The tuning overlay shows note and cents in a thin, elegant font on the right side of the spectrum — green when in tune, yellow/red when off. BPM displays with a pulsing dot that flashes on each beat, with brightness also boosted across the bars/curve visualisation. DSP performance measured at ~3ms average per audio frame against a 46ms budget — 15x headroom with both features active. 57 unit tests passing including 11 new tests for frequencyToNote.
+        </div>
+
+        <div class="tech-note">
+            The debugging process here echoed the audio engine saga from earlier: an approach that works in controlled conditions can fall apart with real-world input. The key difference is that this time, device logs drove every decision. Rather than guessing at thresholds, the <code>acPeak</code> values from actual singing sessions were sent back and the threshold was tuned against real data — 0.25, 0.5, 0.6, 0.75 — each step informed by specific log output showing what was being falsely detected and what was being missed.
+            <br><br>
+            The Pearson normalisation insight is worth remembering: standard autocorrelation normalisation divides by total signal energy, but this is biased toward short lags where the overlap window covers almost the entire signal. Normalising each lag independently by the geometric mean of its specific overlapping segments (<code>sqrt(energy_left * energy_right)</code>) produces a true correlation coefficient in [-1, 1] at every lag, making the threshold meaningful and consistent regardless of lag length. The incremental energy update trick — adjusting the running sum by one sample per lag step — keeps this O(N) overall rather than O(N^2).
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">18</span>
+        <h2 class="step-title">3D Surface Waterfall Mode</h2>
+
+        <div class="prompt">
+            I would like a new rendering mode — 'surface' — which is the curve projected onto a 3D surface where the third axis is time. Time continually moves, so the curve at the front recedes as the next sample's curve is drawn. The camera should be approximately 45 degrees from above. Could we use the same colour scheme as curve mode?
+        </div>
+
+        <div class="response">
+            This required a fundamental extension to the Metal pipeline. The existing four modes all shared a single 2D pass-through shader — no transformation matrix, no depth buffer, no normals. Surface mode needed all three. Rather than inflating the 2D vertex struct with unused fields for 100K+ vertices per frame, a second MTLRenderPipelineState was created with its own shader pair.
+            <br><br>
+            The 3D vertex carries position (SIMD3), surface normal (SIMD3), and colour (SIMD4) — 48 bytes per vertex. The vertex shader transforms by an MVP matrix, and the fragment shader applies directional lighting (N dot L with configurable ambient). A depth buffer (depth32Float) handles occlusion.
+            <br><br>
+            The surface mesh is built from a 40-row circular buffer of spectrum history (~2 seconds at 20fps). Each frame, the CPU generates ~30K vertices as a triangulated grid — X for frequency, Y for amplitude, Z for time — with face normals computed via cross product. The gradient colour scheme matches curve mode (blue through red by frequency position).
+            <br><br>
+            Camera positioning proved surprisingly tricky. The view needed to work across three different Metal view heights — full mic mode, music with just the transport bar, and music with the full browser open. A hard threshold caused a jarring jump during the browser animation. The solution was smooth interpolation between two camera positions based on aspect ratio, blending across the 0.55-0.75 range. Peak height also scales adaptively — taller in the full portrait view (1.2x) to fill the vertical space, shorter in the compact browser view (0.6x).
+        </div>
+
+        <div class="outcome">
+            The surface mode is visually stunning — watching the frequency spectrum flow as a 3D landscape while playing music is mesmerising. The directional lighting from above-left gives the peaks and valleys natural depth. Performance is excellent at ~30K vertices per frame, well within the 200K vertex budget, maintaining 59-60fps. The camera was eventually locked to a fixed position after iterating — user gestures were removed in favour of the angle that looked best.
+            <br><br>
+            A second surface variant (Surface+) was later added with bright ridgeline outlines tracing the frequency curve at each time slice — inspired by curve mode's bright top-edge outline. The ridgelines are drawn as thin quads offset slightly above the mesh surface with a 1.3x colour boost, giving the waterfall a wireframe-over-solid aesthetic that makes individual time slices easier to read. A track switching bug was also fixed during this phase: a playbackGeneration counter was added to AudioEngine that invalidates stale completion handlers when switching tracks, preventing the previous track's end-of-file handler from interfering with the new one. The separate TransportBarView was replaced with a unified music header bar — a single tappable line that serves as both the "Music Library" title and the now-playing display, simplifying the UI.
+        </div>
+
+        <div class="tech-note">
+            The depth buffer format must be declared on ALL pipeline descriptors, not just the 3D one. Metal validates that the pipeline's depthAttachmentPixelFormat matches the MTKView's depthStencilPixelFormat. The 2D pipeline simply doesn't set a depth stencil state, so depth testing remains disabled — but the format declaration is still required. This is easy to miss because the 2D modes worked fine before the depth buffer was added to the view.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">19</span>
+        <h2 class="step-title">Surface Polish: Deeper History, Bluetooth Audio, and Overlay Expansion</h2>
+
+        <div class="prompt">
+            A few questions about the surface modes. Should the surface have 60 slices rather than 40 for the smoothest possible animation? And when playing audio in the app, it only seems to come out the phone speaker, not Bluetooth headphones — is there a reason for that? Also, could we make tuning and BPM mode available in the surface modes as well as in bars and curve?
+        </div>
+
+        <div class="response">
+            Three changes came out of this conversation, each addressing a different aspect of the app:
+            <br><br>
+            <strong>Surface depth 40 → 60 rows:</strong> The original 40-row buffer gave ~2 seconds of history at the ~20fps update rate. With 60 rows, the waterfall extends to ~3 seconds — a deeper, more dramatic perspective. The vertex count rises from ~30K to ~45K for the solid mesh (and ~91K total for Surface+ with ridgelines), but this is still well under the 200K vertex budget. The surface vertex buffer allocation was bumped from 70K to 100K vertices to accommodate. This increase actually revealed a latent bug: Surface+ mode had been silently failing to render because its ~91K vertex payload exceeded the 70K buffer, causing a guard clause to bail out before drawing. The fix was straightforward once identified.
+            <br><br>
+            <strong>Bluetooth audio routing:</strong> The audio session was configured with <code>.defaultToSpeaker</code> to prevent music from playing through the tiny earpiece (the default for <code>.playAndRecord</code>). But this option also overrides Bluetooth routing. Adding <code>.allowBluetooth</code> and <code>.allowBluetoothA2DP</code> to the session options tells iOS to respect connected Bluetooth headphones for output while keeping the speaker as the fallback when no Bluetooth device is connected.
+            <br><br>
+            <strong>Tuning and BPM on surface modes:</strong> The overlay conditions simply needed the surface and surfaceLines cases added alongside bars and curve. The overlays render as SwiftUI text positioned over the Metal view, so they work identically regardless of the underlying rendering pipeline.
+        </div>
+
+        <div class="outcome">
+            The surface modes now show 50% more history depth, making the waterfall effect noticeably richer. Music plays through Bluetooth headphones when connected. The tuner and BPM counter are available across four of the six modes (bars, curve, surface, surface+), leaving only circular and spectrogram without them — which makes sense as those modes don't have the right visual layout for the overlays. All 57 unit tests passing, all six modes verified in the simulator.
+        </div>
+
+        <div class="tech-note">
+            The Surface+ rendering bug was a classic buffer overflow that failed silently. The <code>guard dataSize &lt;= surfaceVertexBuffer.length else { return }</code> check protected against a crash but gave no indication that the mode wasn't rendering. Surface mode (without ridgelines) worked fine at ~45K vertices, masking the fact that Surface+ at ~91K was exceeding the 70K buffer. This is a good argument for logging guard-clause bailouts in rendering code — a silent <code>return</code> in a draw call is almost always a bug, not expected behaviour.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">20</span>
+        <h2 class="step-title">Rethinking BPM Detection: From Onset Intervals to Autocorrelation</h2>
+
+        <div class="prompt">
+            The beat detection often fails. I wonder if we need to make the threshold for success less sensitive. Also, when playing "Missing" by Everything but the Girl, it's showing all sorts of wrong tempos. The track is 123 BPM but we're getting 50, 77, 84, 100 — everything except the right answer. Could we investigate what's going wrong?
+        </div>
+
+        <div class="response">
+            This began as a threshold tuning exercise but turned into a complete algorithmic rewrite — a journey through three fundamentally different approaches to BPM detection, with each failure revealing why the previous approach was structurally wrong for syncopated music.
+            <br><br>
+            <strong>Approach 1: Inter-onset intervals with median (original).</strong> The existing approach detected onset peaks in the spectral flux, recorded their timestamps, took the median interval between consecutive onsets, and converted to BPM. For straight 4/4 beats (like the bundled 120 BPM test tone), this worked perfectly. For "Missing" — a drum &amp; bass track where kicks land on off-beat subdivisions — the intervals scattered wildly: 0.40s, 0.50s, 0.69s, 0.71s, 0.80s, 1.20s. The median landed on ~0.6s (100 BPM), not the true 0.48s (123 BPM).
+            <br><br>
+            <strong>Approach 2: Multi-candidate period scoring.</strong> Instead of trusting the median, this approach scanned every BPM from 60-200 and scored each by how many intervals aligned to integer multiples of that candidate's beat period. The theory: a 123 BPM candidate should match intervals at 0.48s (1 beat), 0.96s (2 beats), etc. In practice, 150 BPM scored higher because its period (0.40s) matched more intervals than 123 BPM (0.48s). The syncopated pattern genuinely has more energy at the subdivision level than the beat level — so the wrong tempo was objectively the better fit for this method.
+            <br><br>
+            <strong>Approach 3: Autocorrelation of the onset strength signal (Scheirer/Ellis).</strong> Research into the literature revealed the fundamental flaw: onset-based methods fail because they discard the continuous character of the rhythmic signal. The solution was to autocorrelate the spectral flux signal itself rather than individual onset timestamps. Even when kicks are syncopated, the overall rhythmic <em>pattern</em> repeats at the beat period — autocorrelation finds this periodicity directly.
+            <br><br>
+            Implementation required solving several sub-problems: the native audio callback rate of ~10fps gave far too coarse lag resolution (each lag step = ~15 BPM), so the flux signal is upsampled 4x via linear interpolation before autocorrelation. Parabolic interpolation around the autocorrelation peak gives sub-lag accuracy. And temporal smoothing (5-estimate median with 4/5 consensus) prevents brief harmonic-switching blips from flipping the display.
+        </div>
+
+        <div class="outcome">
+            With the autocorrelation approach, "Missing" eventually locks onto 120-123 BPM — within 3 BPM of the true 123 BPM. The 120 BPM test file detects instantly with 94% confidence. The transition period when a beat first arrives can take 10-15 seconds to settle as the smoothing buffer fills and the autocorrelation accumulates enough history. The silence suppression correctly hides the BPM display during quiet passages, though the threshold still needs tuning — it occasionally shows false readings during intros with some harmonic content.
+            <br><br>
+            A syncopated 123 BPM test WAV was generated (D&amp;B-style kick pattern: beats 1, 2.5, 4 per bar with hi-hat on every eighth note) and bundled in the app for automated testing. A <code>-bpmlog</code> launch argument was added for verbose BPM diagnostic logging, following the same pattern as <code>-pitchlog</code>.
+        </div>
+
+        <div class="tech-note">
+            The BPM detection journey closely paralleled the pitch detection story from step 17: an approach that works beautifully on clean synthetic test signals fails on real-world music. The common thread is that real-world audio contains complex temporal patterns that can't be reduced to simple interval measurement. Both solutions ended up using autocorrelation — for pitch, autocorrelation of the audio waveform; for BPM, autocorrelation of the onset strength envelope. In both cases, the autocorrelation naturally handles the complexity that defeated the simpler approach.
+            <br><br>
+            The device log-driven debugging process proved essential again. Each iteration was: deploy to device, play "Missing", retrieve logs via <code>xcrun devicectl device copy from</code>, analyse the numbers, design the next fix. The <code>-bpmlog</code> diagnostic output — showing flux values, thresholds, lag positions, confidence, OSS rate, and sample counts — made it possible to diagnose problems without guessing. The discovery that the OSS rate was ~10fps (not the assumed 21fps) came directly from the measured timestamps in the logs, and led to the 4x upsampling solution.
+        </div>
+    </div>
+
+    <div class="step">
+        <span class="step-number">21</span>
+        <h2 class="step-title">BPM Detection: From Research to Production</h2>
+
+        <div class="prompt">
+            The autocorrelation approach from step 20 was close but had issues: false detections during quiet intros, slow convergence, and half-tempo octave errors. Could we do deep research into how professional tools handle this — librosa, aubio, BTrack, Essentia — and implement the best practices?
+        </div>
+
+        <div class="response">
+            An overnight deep-research session produced a comprehensive 650-line report covering five open-source implementations, eight algorithm families, and specific parameter recommendations. The report identified the root causes of each problem and a priority-ordered implementation plan.
+            <br><br>
+            The key insight: three preprocessing steps transform the onset signal from unreliable to robust:
+            <br><br>
+            <strong>1. Log compression</strong> (<code>log(1 + 10 * flux)</code>): Raw spectral flux has enormous dynamic range — a loud kick produces flux 100x larger than a quiet hi-hat. Without compression, the autocorrelation is dominated by a few loud events. Log compression brings quiet onsets to comparable magnitude, making the full rhythmic pattern visible. This is what librosa's onset_strength does via power-to-dB conversion, and it proved to be the single most impactful change.
+            <br><br>
+            <strong>2. Detrending</strong> (subtract 2-second local mean): Slow energy variations — a crescendo, a quiet intro with harmonic content — create a DC component that produces positive autocorrelation at all lags. Subtracting the local mean removes these slow variations while preserving the fast rhythmic peaks. This eliminated the false 82-85 BPM readings during quiet intros.
+            <br><br>
+            <strong>3. Higher onset rate</strong> (~43fps via separate 1024-point FFTs): The original ~10fps rate gave only ~15 BPM resolution per lag step — so coarse that a Gaussian perceptual weighting distorted the peak. A separate 1024-point FFT runs at hop=1024 specifically for onset detection, giving 4 onset samples per audio callback and ~1.5 BPM resolution per lag. This completely eliminated the need for the 4x upsampling hack.
+            <br><br>
+            Additional improvements included harmonic checking at half-lag with a range constraint (resolves octave ambiguity without creating new errors), broadband spectral flux (all frequencies, not just bass — captures hi-hats and snares that carry the rhythmic pulse), reduced temporal smoothing (3 estimates instead of 5 for faster lock-on), and tempo-change detection that flushes the entire buffer when the autocorrelation consistently diverges from the locked tempo.
+            <br><br>
+            A suite of realistic test WAV files was generated: 128 BPM house (4-on-the-floor with offbeat hi-hats), 174 BPM D&amp;B (syncopated kicks with steady hi-hats), a 123 BPM track with a 5-second quiet intro before the beat drops, and a 10-second extract from a real 85 BPM track. An <code>-autoplay</code> launch argument was added for automated device testing — it searches the music library by title substring, starts playback from 1/3 through the track (to skip intros), and enables fully automated BPM testing across the entire library.
+        </div>
+
+        <div class="outcome">
+            An automated batch test across 16 commercial tracks on device produced <strong>14 out of 16 within &plusmn;2 BPM</strong> (87.5% accuracy):
+            <br><br>
+            Get Lucky (116&rarr;116), Sledgehammer (96&rarr;97), Rock DJ (103&rarr;104), Down Under (107&rarr;108), Running Up That Hill (108&rarr;109), Relax (115&rarr;115), Don't You Want Me (118&rarr;119), BBC News24 (120&rarr;120), Cosmic Girl (120&rarr;121), Sussudio (121&rarr;121), One More Time (122&rarr;123), Missing (123&rarr;124), Rhythm of the Night (128&rarr;127), Canned Heat (128&rarr;128), Video Killed the Radio Star (132&rarr;131). A real 85 BPM track detected as 85-86.
+            <br><br>
+            The onset FFTs add ~0.6ms to the per-callback DSP time (~5.4ms total), keeping total DSP well under 15% of the 46ms budget. The remaining known limitation: during quiet intros with harmonic content, the detector may briefly show a false BPM before the real beat arrives. The tempo-change detection handles this by flushing when the real beat starts and the autocorrelation shifts.
+        </div>
+
+        <div class="tech-note">
+            The journey from step 20's initial autocorrelation to this production implementation followed the same pattern as pitch detection in step 17: the algorithm was structurally correct from the start, but the preprocessing and edge-case handling made all the difference. Just as Pearson normalisation transformed pitch autocorrelation from unstable to robust, log compression and detrending transformed BPM autocorrelation from unreliable to accurate.
+            <br><br>
+            Three insights from the automated testing stood out. First, the search range matters enormously — searching 80-160 BPM avoids both half-tempo and double-tempo errors for the vast majority of commercial music. Second, the harmonic check must be constrained to the display range (doubling from 124&rarr;248 BPM then auto-halving to 124 is not the same as staying at 124 — the intermediate step loses accuracy). Third, tempo-change detection is essential for real-world use where tracks change or sections transition — without it, a wrong initial lock persists for the entire 8-second buffer lifetime, and the only workaround is toggling the BPM button off and on.
+            <br><br>
+            The research report (<code>BPM_DETECTION_RESEARCH.md</code>) identified further improvements — mel-frequency onset strength, comb filter banks for faster initial lock, and log-Gaussian perceptual priors — but these are refinements to an already-working system. The 80/20 principle applies: three preprocessing steps (log compression, detrending, higher onset rate) plus three edge-case handlers (harmonic check, BPM floor, tempo-change flush) solved ~90% of the detection failures across 16 diverse tracks.
+        </div>
+    </div>
 </body>
 </html>

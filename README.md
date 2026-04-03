@@ -8,11 +8,13 @@ Captures live microphone audio or plays music from your library, performs Fast F
 
 ## Features
 
-- **Four visualisation modes:**
+- **Six visualisation modes:**
   - **Bars** — Classic equalizer with gradient-coloured vertical bars
   - **Curve** — Smooth filled waveform with bright outline
   - **Circular** — Radial frequency display emanating from centre
   - **Spectrogram** — Scrolling time-frequency heatmap
+  - **Surface** — 3D waterfall mesh showing spectrum evolving over time (~3 seconds of history), with directional lighting and colour gradient
+  - **Surface+** — Surface mode with bright ridgeline outlines tracing each time slice
 - **Dual audio source:**
   - **Microphone** — Live real-time analysis of ambient sound
   - **Music library** — Play purchased/imported tracks with real-time spectrum analysis
@@ -28,6 +30,11 @@ Captures live microphone audio or plays music from your library, performs Fast F
 - **Colour gradient** from cool (bass) to hot (treble): blue-cyan-green-yellow-red
 - **Spectral tilt compensation** — exponential treble boost in music mode brings the full 20Hz–20kHz range to life
 - **DRM-aware library browser** — three-tier filtering removes cloud-only, DRM-protected, and Apple Music cached streaming tracks (`.movpkg`)
+- **Instrument tuner** — real-time fundamental frequency detection via autocorrelation, displays note name and cents offset (e.g. A4 +1), colour-coded green/yellow/red (bars, curve, surface, surface+ modes)
+- **BPM counter** — tempo detection via autocorrelation of a log-compressed, detrended onset strength signal at ~43fps (Scheirer/Ellis method). Handles syncopated rhythms including drum & bass and electronic music. Harmonic checking resolves octave ambiguity. Tempo-change detection automatically adapts when tracks change. Tested across 16 commercial tracks at 87.5% accuracy within ±2 BPM. Visual beat flash on detected onsets (bars, curve, surface, surface+ modes)
+- **Bluetooth audio output** — music plays through connected Bluetooth headphones when available, falls back to speaker
+- **Persistent settings** — visualisation mode, audio source, and feature toggles remember your preferences across launches
+- **Long-press tooltips** — hold any toolbar icon to see its label
 
 ## Requirements
 
@@ -53,8 +60,12 @@ Captures live microphone audio or plays music from your library, performs Fast F
 4. **Band Mapping**: FFT bins are mapped to 128 logarithmic frequency bands
 5. **Auto-Leveling**: Display range adapts to the current signal (40dB window, instant rise, slow decay)
 6. **Spectral Tilt** (music mode): Exponential treble boost compensates for the steep high-frequency rolloff of commercial music
-7. **60fps Smoothing**: Metal renderer interpolates between audio frames with asymmetric lerp for buttery animation
-8. **Rendering**: Metal builds and renders up to 200K coloured vertices per frame
+7. **Pitch Detection**: Time-domain autocorrelation with Pearson normalisation finds the fundamental frequency; parabolic interpolation gives sub-Hz accuracy; median-filtered for stability
+8. **BPM Detection**: A separate 1024-point FFT at ~43fps computes broadband spectral flux, log-compressed and detrended, then autocorrelated to find the dominant rhythmic periodicity — robust to syncopated beats. Harmonic checking and BPM floor resolve octave ambiguity
+9. **60fps Smoothing**: Metal renderer interpolates between audio frames with asymmetric lerp for buttery animation
+10. **Rendering**: Metal builds and renders up to 200K coloured vertices per frame
+
+Surface mode uses a separate 3D Metal pipeline with a depth buffer and directional lighting to render the waterfall mesh. The tuner and BPM overlays work in surface modes as well as bars and curve.
 
 ## Music Mode
 
@@ -72,10 +83,17 @@ For automated testing, the app accepts command-line arguments:
 | `-mode curve` | Launch in Curve mode |
 | `-mode circular` | Launch in Circular mode |
 | `-mode spectrogram` | Launch in Spectrogram mode |
+| `-mode surface` | Launch in Surface mode |
+| `-mode surface+` | Launch in Surface+ mode |
 | `-source mic` | Launch in Mic mode (default) |
 | `-source music` | Launch in Music mode |
 | `-testfile <name>` | Play a bundled audio file (skips library browser) |
 | `-gain <dB>` | Static dB boost for simulator testing with quiet audio |
+| `-tuning` | Enable tuner overlay on launch |
+| `-bpm` | Enable BPM counter overlay on launch |
+| `-pitchlog` | Enable verbose pitch detection logging to spectrum.log |
+| `-bpmlog` | Enable verbose BPM detection logging to spectrum.log |
+| `-autoplay <title>` | Auto-play a track from music library matching title substring |
 
 ```bash
 xcrun simctl launch booted com.pwilliams.Spectrum -- -testfile test_tone.wav -mode spectrogram
@@ -83,7 +101,7 @@ xcrun simctl launch booted com.pwilliams.Spectrum -- -testfile test_tone.wav -mo
 
 ## Testing
 
-46 unit tests covering FFT band mapping, auto-level range parameters, smoothing, peak tracking, gradient/heatmap colour functions, layout constants, and coordinate conversion. Run with:
+67 unit tests covering FFT band mapping, auto-level range parameters, smoothing, peak tracking, pitch detection, gradient/heatmap colour functions, layout constants, and coordinate conversion. Run with:
 
 ```bash
 xcodebuild -project Spectrum.xcodeproj -scheme Spectrum \
@@ -91,12 +109,12 @@ xcodebuild -project Spectrum.xcodeproj -scheme Spectrum \
   CODE_SIGNING_ALLOWED=NO
 ```
 
-Music playback is tested in the simulator using a bundled 440Hz+880Hz test tone (`test_tone.wav`). Mic input and source switching require a physical device.
+Music playback is tested in the simulator using bundled test files: a 440Hz+880Hz test tone (`test_tone.wav`), a 120 BPM kick drum loop (`beat_120bpm.wav`), a 128 BPM house pattern (`house_128bpm.wav`), a 174 BPM D&B pattern with hi-hats (`dnb_174bpm.wav`), a quiet-intro-then-beat track (`intro_then_beat_123bpm.wav`), and a pitch-changing sequence (`pitch_test.wav`). A real 85 BPM music extract (`paul_85bpm.wav`) tests complex-signal BPM detection. On-device testing with real music uses `-autoplay <title>` to play a library track by name (starts from 1/3 through the track to skip intros). Mic input and source switching require a physical device.
 
 ## Roadmap
 
-- **Instrument tuner** — Fundamental frequency detection with musical note display and cents offset
-- **BPM counter** — Beat detection via low-frequency energy flux with tempo display
+- **Audio recording / export** — Record the analysed audio alongside the visualisation
+- **Custom colour themes** — User-selectable gradient palettes
 
 ## Tech Stack
 

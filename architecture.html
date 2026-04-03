@@ -1231,6 +1231,942 @@
                 G --> I
                 H --> I
                 I -->|"xcrun simctl io screenshot"| J[Verify Rendering]
+                B --> K{Parse -testfile arg}
+                K -->|test_tone.wav| L[440+880Hz sine waves]
+                K -->|pink_tone.wav| M[29-tone pink noise profile]
+                K -->|pitch_test.wav| N[Pitch detection test tone]
+                B --> O{Parse -pitchlog}
+                O -->|present| P[Log pitch detection values to console]
+        </div>
+    </div>
+
+    <div class="deep-dive">
+        <h2>Part 4: Pitch Detection — Time-Domain Autocorrelation</h2>
+
+        <p>A spectrum analyser shows <em>what frequencies are present</em> in a signal. A tuner goes further: it identifies the single <strong>fundamental pitch</strong> the listener perceives — the note a musician is playing — and tells them how far sharp or flat they are. This turns out to be a surprisingly subtle problem, and the solution that works robustly for real voices and instruments is a direct, time-domain approach: computing autocorrelation from the raw audio samples themselves.</p>
+
+        <h3>The Problem: Why the Loudest Bin Is Not the Pitch</h3>
+
+        <p>The naive approach — "find the FFT bin with the highest magnitude and call that the pitch" — fails for almost every real instrument. The reason is <strong>harmonics</strong>. When a guitar plays A4 (440 Hz), the string vibrates not just at 440 Hz but simultaneously at 880, 1320, 1760 Hz and beyond. These are integer multiples of the fundamental, and for many instruments and the human voice, the second or third harmonic is louder than the fundamental itself.</p>
+
+        <div class="inline-diagram">
+            <svg width="600" height="200" viewBox="0 0 600 200">
+                <!-- Axis -->
+                <line x1="50" y1="160" x2="570" y2="160" stroke="#1e1e3a" stroke-width="1"/>
+                <line x1="50" y1="160" x2="50" y2="20" stroke="#1e1e3a" stroke-width="1"/>
+                <text x="310" y="195" fill="#888" font-size="10" text-anchor="middle">Frequency (Hz)</text>
+                <text x="25" y="90" fill="#888" font-size="10" text-anchor="middle" transform="rotate(-90,25,90)">Magnitude</text>
+
+                <!-- Fundamental - shorter than harmonics -->
+                <rect x="90" y="90" width="22" height="70" fill="#00cc8855" stroke="#00cc88" stroke-width="1.5" rx="2"/>
+                <text x="101" y="175" fill="#00cc88" font-size="9" text-anchor="middle">440</text>
+                <text x="101" y="85" fill="#00cc88" font-size="8" text-anchor="middle">f0</text>
+
+                <!-- 2nd harmonic - tallest -->
+                <rect x="180" y="35" width="22" height="125" fill="#ff6b3555" stroke="#ff6b35" stroke-width="1.5" rx="2"/>
+                <text x="191" y="175" fill="#ff6b35" font-size="9" text-anchor="middle">880</text>
+                <text x="191" y="28" fill="#ff6b35" font-size="8" text-anchor="middle">2f0</text>
+
+                <!-- 3rd harmonic -->
+                <rect x="270" y="55" width="22" height="105" fill="#cc88ff55" stroke="#cc88ff" stroke-width="1.5" rx="2"/>
+                <text x="281" y="175" fill="#cc88ff" font-size="9" text-anchor="middle">1320</text>
+                <text x="281" y="48" fill="#cc88ff" font-size="8" text-anchor="middle">3f0</text>
+
+                <!-- 4th harmonic -->
+                <rect x="360" y="100" width="22" height="60" fill="#ffcc0055" stroke="#ffcc00" stroke-width="1.5" rx="2"/>
+                <text x="371" y="175" fill="#ffcc00" font-size="9" text-anchor="middle">1760</text>
+                <text x="371" y="95" fill="#ffcc00" font-size="8" text-anchor="middle">4f0</text>
+
+                <!-- 5th harmonic -->
+                <rect x="450" y="120" width="22" height="40" fill="#4488ff55" stroke="#4488ff" stroke-width="1.5" rx="2"/>
+                <text x="461" y="175" fill="#4488ff" font-size="9" text-anchor="middle">2200</text>
+                <text x="461" y="115" fill="#4488ff" font-size="8" text-anchor="middle">5f0</text>
+
+                <!-- Annotation -->
+                <line x1="191" y1="32" x2="240" y2="18" stroke="#ff6b35" stroke-width="1" stroke-dasharray="3"/>
+                <text x="245" y="18" fill="#ff6b35" font-size="9">Loudest bin! But perceived pitch is 440 Hz</text>
+
+                <line x1="101" y1="88" x2="65" y2="60" stroke="#00cc88" stroke-width="1" stroke-dasharray="3"/>
+                <text x="60" y="55" fill="#00cc88" font-size="9" text-anchor="end">Fundamental</text>
+                <text x="60" y="67" fill="#00cc88" font-size="9" text-anchor="end">(quieter!)</text>
+            </svg>
+        </div>
+
+        <p>There is a second problem: <strong>frequency resolution</strong>. With a 2048-sample FFT at 44100 Hz, each bin spans 44100/2048 = 21.5 Hz. The semitone above A4 is Bb4 at 466.2 Hz — a gap of just 26.2 Hz, barely more than one bin width. At lower pitches the problem is worse: the semitone from E2 (82.4 Hz) to F2 (87.3 Hz) is only 4.9 Hz, meaning several notes share the same FFT bin. Simply reading bin indices cannot achieve the sub-hertz accuracy a musician needs.</p>
+
+        <p>We need a method that finds the <em>period</em> of the fundamental — the common spacing between all harmonics — regardless of which harmonic is loudest, and with much finer resolution than the FFT grid allows.</p>
+
+        <h3>Autocorrelation: Finding Periodicity</h3>
+
+        <p>The key insight is that a periodic signal, when compared with a time-shifted copy of itself, will show maximum similarity at a shift (or <em>lag</em>) equal to one full period. This self-similarity measure is called <strong>autocorrelation</strong>.</p>
+
+        <p>Imagine photocopying a waveform onto a transparency and sliding it over the original. At zero offset, every peak aligns — perfect correlation. As you slide, alignment degrades. But when you shift by exactly one period, peaks align again. The lag at this alignment is the fundamental period, and the frequency is simply 1/period.</p>
+
+        <div class="inline-diagram">
+            <svg width="600" height="250" viewBox="0 0 600 250">
+                <!-- Original signal -->
+                <text x="300" y="15" fill="#888" font-size="11" text-anchor="middle">Autocorrelation: slide the signal over itself</text>
+
+                <!-- Signal 1 (original) -->
+                <text x="30" y="50" fill="#00d4ff" font-size="9" text-anchor="end">original</text>
+                <rect x="40" y="35" width="520" height="50" rx="4" fill="#0d0d1a" stroke="#1e1e3a"/>
+                <path d="M50,60 Q80,35 110,60 Q140,85 170,60 Q200,35 230,60 Q260,85 290,60 Q320,35 350,60 Q380,85 410,60 Q440,35 470,60 Q500,85 530,60" fill="none" stroke="#00d4ff" stroke-width="2"/>
+
+                <!-- Signal 2 (shifted by one period) -->
+                <text x="30" y="125" fill="#00cc88" font-size="9" text-anchor="end">shifted</text>
+                <text x="30" y="137" fill="#00cc88" font-size="9" text-anchor="end">by lag T</text>
+                <rect x="40" y="110" width="520" height="50" rx="4" fill="#0d0d1a" stroke="#1e1e3a"/>
+                <path d="M50,135 Q80,160 110,135 Q140,110 170,135 Q200,160 230,135 Q260,110 290,135 Q320,160 350,135 Q380,110 410,135 Q440,160 470,135 Q500,110 530,135" fill="none" stroke="#00cc88" stroke-width="2" stroke-dasharray="6,3"/>
+
+                <!-- Period markers -->
+                <line x1="50" y1="90" x2="50" y2="105" stroke="#ffcc00" stroke-width="1.5"/>
+                <line x1="170" y1="90" x2="170" y2="105" stroke="#ffcc00" stroke-width="1.5"/>
+                <line x1="50" y1="97" x2="170" y2="97" stroke="#ffcc00" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+                <line x1="170" y1="97" x2="50" y2="97" stroke="#ffcc00" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+                <text x="110" y="107" fill="#ffcc00" font-size="10" text-anchor="middle">period T</text>
+
+                <!-- Correlation result -->
+                <text x="300" y="185" fill="#888" font-size="10" text-anchor="middle">Autocorrelation R(lag) vs lag</text>
+                <rect x="40" y="190" width="520" height="55" rx="4" fill="#0d0d1a" stroke="#1e1e3a"/>
+                <!-- Autocorrelation curve: peak at 0, dip, peak at T, dip, peak at 2T -->
+                <path d="M50,195 Q60,195 65,200 Q80,220 110,230 Q130,235 150,225 Q160,215 170,195 Q180,215 190,225 Q210,235 230,230 Q260,220 280,230 Q290,215 290,195" fill="none" stroke="#cc88ff" stroke-width="2"/>
+                <!-- Labels -->
+                <text x="50" y="248" fill="#cc88ff" font-size="8" text-anchor="middle">lag=0</text>
+                <text x="170" y="248" fill="#ffcc00" font-size="8" text-anchor="middle">lag=T</text>
+                <text x="290" y="248" fill="#888" font-size="8" text-anchor="middle">lag=2T</text>
+                <!-- Peak markers -->
+                <circle cx="50" cy="195" r="3" fill="#cc88ff"/>
+                <circle cx="170" cy="195" r="3" fill="#ffcc00"/>
+                <circle cx="290" cy="195" r="3" fill="#888"/>
+                <text x="365" y="215" fill="#ffcc00" font-size="9">Peak at lag T = fundamental period</text>
+                <text x="365" y="230" fill="#ffcc00" font-size="9">Frequency = sampleRate / T</text>
+            </svg>
+        </div>
+
+        <h3>Why Not Wiener-Khinchin? A Development Journey</h3>
+
+        <p>The initial implementation used the <strong>Wiener-Khinchin theorem</strong>, which computes autocorrelation as the inverse FFT of the power spectrum: R[L] = IFFT(|X[k]|^2). This was mathematically elegant and computationally efficient — the power spectrum was already available from the visualiser pipeline, so pitch detection cost just one additional IFFT (~5 microseconds). It worked beautifully for pure test tones.</p>
+
+        <p>However, the Wiener-Khinchin approach failed badly for real voice and instruments. The root cause: <strong>squaring the power spectrum exaggerates harmonics</strong>. When the power spectrum is squared (|X[k]|^2 becoming |X[k]|^4 in effect), already-strong harmonics become disproportionately dominant. For a human voice where the second harmonic is naturally louder than the fundamental, the squaring makes the sub-harmonic peak at lag=2T (one octave low) competitive with or stronger than the true peak at lag=T. The result was wild octave errors and instability — the detected pitch would jump erratically between the correct note and one octave below.</p>
+
+        <p>The solution was to abandon the frequency-domain shortcut entirely and compute autocorrelation directly from the time-domain audio samples, using <strong>Pearson-normalised correlation</strong> that treats each lag independently.</p>
+
+        <h3>Time-Domain Autocorrelation with Pearson Normalisation</h3>
+
+        <p>For each candidate lag L, we compute the <strong>Pearson correlation coefficient</strong> between the original signal segment x[0..n-L] and the shifted segment x[L..n]. Unlike the raw dot product (which depends on signal energy and decreases at longer lags), the Pearson coefficient is normalised to the range [-1, 1], making it directly comparable across all lags:</p>
+
+        <div class="math">
+            <span class="heading">Pearson-normalised autocorrelation</span>
+            <span class="var">r</span>[<span class="var">L</span>] <span class="op">=</span> <span class="fn">dot</span>(<span class="var">x</span>, <span class="var">x</span><span class="op">+</span><span class="var">L</span>) / <span class="fn">sqrt</span>(<span class="fn">dot</span>(<span class="var">x</span>[0..<span class="var">n</span><span class="op">-</span><span class="var">L</span>], <span class="var">x</span>[0..<span class="var">n</span><span class="op">-</span><span class="var">L</span>]) <span class="op">x</span> <span class="fn">dot</span>(<span class="var">x</span>[<span class="var">L</span>..<span class="var">n</span>], <span class="var">x</span>[<span class="var">L</span>..<span class="var">n</span>]))<br>
+            <br>
+            <span class="heading">Where</span>
+            <table>
+                <tr><td><span class="fn">dot</span>(<span class="var">x</span>, <span class="var">x</span><span class="op">+</span><span class="var">L</span>)</td><td>Cross-correlation: <span class="fn">vDSP_dotpr</span>(x[0..n-L], x[L..n])</td></tr>
+                <tr><td><span class="fn">dot</span>(<span class="var">x</span>[0..<span class="var">n-L</span>], ...)</td><td>Energy of the left segment (denominator, left term)</td></tr>
+                <tr><td><span class="fn">dot</span>(<span class="var">x</span>[<span class="var">L</span>..<span class="var">n</span>], ...)</td><td>Energy of the right segment (denominator, right term)</td></tr>
+                <tr><td><span class="var">r</span>[<span class="var">L</span>]</td><td>Normalised correlation at lag L, range [-1, 1]</td></tr>
+            </table>
+            <br>
+            <span class="heading">Key property</span>
+            <span class="comment">Pure tone at lag = period: r approaches 1.0 regardless of amplitude</span><br>
+            <span class="comment">White noise at any lag: r stays near 0.0</span><br>
+            <span class="comment">Human voice at fundamental period: r typically 0.93+</span><br>
+            <span class="comment">Background noise maximum: r typically ~0.68 or below</span>
+        </div>
+
+        <p><strong>Incremental energy update:</strong> The naive approach recomputes both segment energies from scratch for every lag — O(N) work per lag, O(N^2) total. Instead, the segment energies are updated incrementally: as the lag advances from L to L+1, one sample leaves the left segment and one enters the right segment. Each energy update is O(1): subtract the departing sample's squared value, add the arriving sample's squared value. This reduces the inner loop to a single <code>vDSP_dotpr</code> call plus two additions per lag.</p>
+
+        <p><strong>First-peak search:</strong> The search scans from high frequency to low (starting at 1000 Hz, i.e. short lags) and returns the <em>first</em> peak above the 0.75 confidence threshold — not the global maximum. This is critical for avoiding sub-harmonic errors: the autocorrelation always has a peak at 2T (the second period) that can be stronger than the peak at T for complex timbres. By searching from short lags upward and stopping at the first confident peak, the algorithm naturally finds the fundamental period rather than a sub-harmonic.</p>
+
+        <div class="mermaid">
+            graph TD
+                SAMPLES["Raw Audio Samples<br/>(2048 float buffer)"] --> DOTPR["vDSP_dotpr per lag<br/>cross-correlation"]
+                DOTPR --> PEARSON["Pearson Normalisation<br/>r[L] = dot / sqrt(leftEnergy x rightEnergy)"]
+                PEARSON --> SEARCH["First Peak Search<br/>65Hz-1000Hz range, threshold 0.75"]
+                SEARCH --> PARA["Parabolic Interpolation<br/>sub-sample precision"]
+                PARA --> FREQ["Frequency = sampleRate / refinedLag"]
+                FREQ --> NOTE["Note Lookup<br/>semitones = 12 x log2(f/440)"]
+                NOTE --> DISPLAY["Note Name + Octave + Cents Offset<br/>e.g. A4 +3 cents"]
+        </div>
+
+        <h3>Parabolic Interpolation: Sub-Sample Precision</h3>
+
+        <p>The autocorrelation gives us one value per integer lag — one per sample. At 44100 Hz, the lag for A4 (440 Hz) is 44100/440 = 100.23 samples. The nearest integer lags are 100 and 101, corresponding to frequencies 441.0 Hz and 436.6 Hz respectively — a difference of 4.4 Hz, which is 17 cents (nearly a fifth of a semitone). A musician needs accuracy of 1-2 cents.</p>
+
+        <p>The solution is <strong>parabolic interpolation</strong>: fit a parabola through the peak sample and its two neighbours, then find the true peak of the parabola. This yields sub-sample accuracy from integer-spaced data.</p>
+
+        <div class="inline-diagram">
+            <svg width="600" height="220" viewBox="0 0 600 220">
+                <!-- Axes -->
+                <line x1="80" y1="180" x2="520" y2="180" stroke="#1e1e3a" stroke-width="1"/>
+                <line x1="80" y1="180" x2="80" y2="30" stroke="#1e1e3a" stroke-width="1"/>
+                <text x="300" y="210" fill="#888" font-size="10" text-anchor="middle">Lag (samples)</text>
+                <text x="55" y="105" fill="#888" font-size="10" text-anchor="middle" transform="rotate(-90,55,105)">R[L]</text>
+
+                <!-- Discrete autocorrelation samples (dots connected by faint line) -->
+                <circle cx="140" cy="150" r="4" fill="#666"/>
+                <circle cx="220" cy="110" r="4" fill="#666"/>
+                <circle cx="300" cy="52" r="6" fill="#00d4ff" stroke="#00d4ff" stroke-width="2"/>
+                <circle cx="380" cy="95" r="4" fill="#666"/>
+                <circle cx="460" cy="155" r="4" fill="#666"/>
+                <line x1="140" y1="150" x2="220" y2="110" stroke="#334" stroke-width="1"/>
+                <line x1="220" y1="110" x2="300" y2="52" stroke="#334" stroke-width="1"/>
+                <line x1="300" y1="52" x2="380" y2="95" stroke="#334" stroke-width="1"/>
+                <line x1="380" y1="95" x2="460" y2="155" stroke="#334" stroke-width="1"/>
+
+                <!-- Labels for three key samples -->
+                <text x="220" y="128" fill="#888" font-size="9" text-anchor="middle">a</text>
+                <text x="300" y="70" fill="#00d4ff" font-size="9" text-anchor="middle">b (peak)</text>
+                <text x="380" y="113" fill="#888" font-size="9" text-anchor="middle">c</text>
+
+                <!-- Lag labels -->
+                <text x="220" y="196" fill="#888" font-size="9" text-anchor="middle">L-1</text>
+                <text x="300" y="196" fill="#00d4ff" font-size="9" text-anchor="middle">L</text>
+                <text x="380" y="196" fill="#888" font-size="9" text-anchor="middle">L+1</text>
+
+                <!-- Parabola through three points -->
+                <path d="M180,160 Q220,110 260,65 Q290,42 320,52 Q360,80 400,120 Q420,145 440,170" fill="none" stroke="#cc88ff" stroke-width="2" stroke-dasharray="6,3"/>
+
+                <!-- True peak of parabola -->
+                <circle cx="286" cy="43" r="5" fill="none" stroke="#ffcc00" stroke-width="2"/>
+                <line x1="286" y1="48" x2="286" y2="180" stroke="#ffcc00" stroke-width="1" stroke-dasharray="3"/>
+                <text x="286" y="196" fill="#ffcc00" font-size="9" text-anchor="middle">L+d</text>
+
+                <!-- Annotation -->
+                <text x="400" y="40" fill="#cc88ff" font-size="9">Fitted parabola</text>
+                <text x="400" y="55" fill="#ffcc00" font-size="9">True peak at L + d</text>
+                <text x="400" y="70" fill="#ffcc00" font-size="9">(sub-sample precision)</text>
+            </svg>
+        </div>
+
+        <div class="math">
+            <span class="heading">Three-point parabolic interpolation</span>
+            Given samples <span class="var">a</span> <span class="op">=</span> <span class="var">R</span>[<span class="var">L</span><span class="op">-</span><span class="num">1</span>], &nbsp;<span class="var">b</span> <span class="op">=</span> <span class="var">R</span>[<span class="var">L</span>], &nbsp;<span class="var">c</span> <span class="op">=</span> <span class="var">R</span>[<span class="var">L</span><span class="op">+</span><span class="num">1</span>] &nbsp;<span class="comment">around the peak at lag L</span><br>
+            <br>
+            <span class="heading">Fractional offset from L</span>
+            <span class="var">d</span> <span class="op">=</span> (<span class="var">a</span> <span class="op">-</span> <span class="var">c</span>) / (<span class="num">2</span> <span class="op">x</span> (<span class="var">a</span> <span class="op">-</span> <span class="num">2</span><span class="var">b</span> <span class="op">+</span> <span class="var">c</span>))<br>
+            <br>
+            <span class="heading">Refined lag</span>
+            <span class="var">refinedLag</span> <span class="op">=</span> <span class="var">L</span> <span class="op">+</span> <span class="var">d</span> <span class="comment">&nbsp;&nbsp;(d is typically in the range -0.5 to +0.5)</span><br>
+            <br>
+            <span class="heading">Frequency</span>
+            <span class="var">frequency</span> <span class="op">=</span> <span class="var">sampleRate</span> / <span class="var">refinedLag</span><br>
+            <br>
+            <span class="heading">Example: detecting A4</span>
+            <span class="comment">Integer peak at lag</span> <span class="var">L</span> <span class="op">=</span> <span class="num">100</span> <span class="comment">(= 44100/441 Hz)</span><br>
+            <span class="comment">After interpolation:</span> <span class="var">refinedLag</span> <span class="op">=</span> <span class="num">100.23</span><br>
+            <span class="var">frequency</span> <span class="op">=</span> <span class="num">44100</span> / <span class="num">100.23</span> <span class="op">=</span> <span class="result">440.0 Hz</span> <span class="comment">&nbsp;&nbsp;(sub-Hz accuracy from integer data)</span>
+        </div>
+
+        <p>This is the same technique used in professional tuners. The parabolic fit costs three multiplies and two divides — negligible compared to the autocorrelation loop — but converts bin-level resolution into the sub-hertz accuracy musicians require.</p>
+
+        <h3>Musical Note Conversion</h3>
+
+        <p>Once we have a precise frequency, converting to a musical note name involves logarithmic maths and a lookup table. Western music divides the octave into 12 equal semitones, where each semitone is a frequency ratio of 2^(1/12) = 1.05946. The reference point is A4 = 440 Hz.</p>
+
+        <div class="math">
+            <span class="heading">Frequency to MIDI note number</span>
+            <span class="var">semitones</span> <span class="op">=</span> <span class="num">12</span> <span class="op">x</span> <span class="fn">log2</span>(<span class="var">freq</span> / <span class="num">440</span>)<br>
+            <span class="var">midiNote</span> <span class="op">=</span> <span class="fn">round</span>(<span class="var">semitones</span>) <span class="op">+</span> <span class="num">69</span> <span class="comment">&nbsp;&nbsp;(A4 = MIDI 69)</span><br>
+            <br>
+            <span class="heading">Extract note name and octave</span>
+            <span class="var">noteIndex</span> <span class="op">=</span> <span class="var">midiNote</span> <span class="fn">mod</span> <span class="num">12</span> <span class="comment">&nbsp;&nbsp;(0=C, 1=C#, 2=D, ... 11=B)</span><br>
+            <span class="var">octave</span> <span class="op">=</span> (<span class="var">midiNote</span> / <span class="num">12</span>) <span class="op">-</span> <span class="num">1</span><br>
+            <br>
+            <span class="heading">Cents offset (tuning error)</span>
+            <span class="var">cents</span> <span class="op">=</span> (<span class="var">semitones</span> <span class="op">-</span> <span class="fn">round</span>(<span class="var">semitones</span>)) <span class="op">x</span> <span class="num">100</span><br>
+            <span class="comment">Negative = flat, positive = sharp. Range: -50 to +50 cents.</span><br>
+            <br>
+            <span class="heading">Examples</span>
+            <table>
+                <tr><th>Frequency</th><th>Semitones from A4</th><th>MIDI</th><th>Note</th><th>Cents</th></tr>
+                <tr><td><span class="num">440.00 Hz</span></td><td><span class="num">0.00</span></td><td><span class="num">69</span></td><td><span class="result">A4</span></td><td><span class="result">+0</span></td></tr>
+                <tr><td><span class="num">443.50 Hz</span></td><td><span class="num">+0.14</span></td><td><span class="num">69</span></td><td><span class="result">A4</span></td><td><span class="result">+14</span> <span class="comment">sharp</span></td></tr>
+                <tr><td><span class="num">261.63 Hz</span></td><td><span class="num">-8.99</span></td><td><span class="num">60</span></td><td><span class="result">C4</span></td><td><span class="result">-1</span></td></tr>
+                <tr><td><span class="num">329.63 Hz</span></td><td><span class="num">-5.00</span></td><td><span class="num">64</span></td><td><span class="result">E4</span></td><td><span class="result">+0</span></td></tr>
+                <tr><td><span class="num">82.41 Hz</span></td><td><span class="num">-28.00</span></td><td><span class="num">40</span></td><td><span class="result">E2</span></td><td><span class="result">+0</span> <span class="comment">low E string</span></td></tr>
+            </table>
+        </div>
+
+        <h3>Confidence and Smoothing</h3>
+
+        <p>Not every audio frame contains a clear pitch. Background noise, breath sounds, percussive hits, and polyphonic passages all produce autocorrelation functions without a dominant peak. Displaying a wildly flickering note name in these situations is worse than displaying nothing.</p>
+
+        <p><strong>Confidence metric:</strong> The Pearson correlation coefficient at the detected peak directly measures how periodic the signal is. A pure sine wave gives close to 1.0; white noise stays near 0. With Pearson normalisation, the threshold for a "confident" pitch detection is <strong>0.75</strong>. This cleanly separates pitched signals from noise: human voice typically produces peaks of 0.93 or higher, while background noise rarely exceeds 0.68. The high threshold eliminates the false detections that plagued the earlier Wiener-Khinchin approach.</p>
+
+        <p><strong>Median filtering over averaging:</strong> Pitch estimates are subject to occasional <em>octave errors</em> — the autocorrelation can lock onto a sub-harmonic, producing a reading one octave low. A simple moving average would blend these errors into the result, producing a pitch that is neither correct nor one octave off — just wrong. A <strong>median filter</strong> (over 3 frames, ~144ms) rejects these outliers cleanly: if 2 out of 3 frames read 440 Hz and one reads 220 Hz, the median is 440 Hz. The octave jump is discarded entirely. The shorter 3-frame window (compared to the 5-frame window used in the earlier implementation) provides faster response while the Pearson normalisation's inherent stability means fewer outliers need filtering.</p>
+
+        <p><strong>Colour coding for tuning accuracy:</strong></p>
+
+        <div class="inline-diagram">
+            <svg width="500" height="80" viewBox="0 0 500 80">
+                <!-- Tuning accuracy zones -->
+                <rect x="50" y="10" width="130" height="30" rx="6" fill="#00cc8833" stroke="#00cc88"/>
+                <text x="115" y="30" fill="#00cc88" font-size="11" text-anchor="middle" font-weight="bold">GREEN</text>
+                <text x="115" y="55" fill="#888" font-size="10" text-anchor="middle">within 10 cents</text>
+                <text x="115" y="68" fill="#666" font-size="9" text-anchor="middle">"in tune"</text>
+
+                <rect x="195" y="10" width="130" height="30" rx="6" fill="#ffcc0033" stroke="#ffcc00"/>
+                <text x="260" y="30" fill="#ffcc00" font-size="11" text-anchor="middle" font-weight="bold">YELLOW</text>
+                <text x="260" y="55" fill="#888" font-size="10" text-anchor="middle">10 to 25 cents</text>
+                <text x="260" y="68" fill="#666" font-size="9" text-anchor="middle">"close"</text>
+
+                <rect x="340" y="10" width="130" height="30" rx="6" fill="#ff444433" stroke="#ff4444"/>
+                <text x="405" y="30" fill="#ff4444" font-size="11" text-anchor="middle" font-weight="bold">RED</text>
+                <text x="405" y="55" fill="#888" font-size="10" text-anchor="middle">25 cents or more</text>
+                <text x="405" y="68" fill="#666" font-size="9" text-anchor="middle">"out of tune"</text>
+            </svg>
+        </div>
+
+        <div class="math">
+            <span class="heading">Complete pitch detection pipeline timing</span>
+            <table>
+                <tr><th>Stage</th><th>Operation</th><th>Time (est.)</th></tr>
+                <tr><td>Autocorrelation</td><td><span class="fn">vDSP_dotpr</span> per lag, incremental energy</td><td><span class="num">~5 us</span></td></tr>
+                <tr><td>Peak search</td><td>First peak above 0.75 in lags 44–678 (65Hz–1000Hz)</td><td><span class="num">~1 us</span></td></tr>
+                <tr><td>Parabolic interp.</td><td>3 multiplies, 2 divides</td><td><span class="num">&lt;0.1 us</span></td></tr>
+                <tr><td>Note lookup</td><td>log2, round, mod</td><td><span class="num">&lt;0.1 us</span></td></tr>
+                <tr><td>Median filter</td><td>Sort 3 values</td><td><span class="num">&lt;0.1 us</span></td></tr>
+                <tr><td style="border-top: 1px solid #334"><span class="result">Total</span></td><td></td><td><span class="result">~7 us</span></td></tr>
+            </table>
+            <br>
+            <span class="comment">Added to the existing ~10 us visualisation pipeline = ~17 us total.</span><br>
+            <span class="comment">Budget per audio frame: 46.4 ms. Headroom: 99.96%.</span>
+        </div>
+    </div>
+
+    <div class="deep-dive">
+        <h2>Part 5: Beat Detection — Spectral Flux and Tempo Estimation</h2>
+
+        <p>Where pitch detection asks "what note is playing?", beat detection asks "when do rhythmic events happen, and how regularly?" A kick drum, a snare hit, a chord strum — these are <em>onsets</em>: sudden increases in energy that punctuate the flow of music. Detect enough of them, measure the gaps between them, and you have the tempo.</p>
+
+        <p>Unlike pitch, which is a frequency-domain question (which frequency dominates?), beat detection is fundamentally about <strong>change over time</strong> in the spectrum. A steady tone at 100 Hz has no beats. A drum hit at 100 Hz is a <em>sudden appearance</em> of energy at 100 Hz. The distinction lies not in a single FFT frame, but in how consecutive frames differ.</p>
+
+        <h3>Spectral Flux: Measuring Spectral Change</h3>
+
+        <p><strong>Spectral flux</strong> quantifies how much the spectrum has changed between two consecutive FFT frames. Specifically, it sums the <em>positive</em> magnitude increases across the low-frequency bins where percussive energy concentrates (20-200 Hz). We ignore decreases — a note dying away is not an onset.</p>
+
+        <div class="inline-diagram">
+            <svg width="600" height="230" viewBox="0 0 600 230">
+                <!-- Frame N-1 -->
+                <text x="150" y="15" fill="#888" font-size="10" text-anchor="middle">Frame N-1 (previous)</text>
+                <rect x="30" y="22" width="240" height="90" rx="4" fill="#0d0d1a" stroke="#1e1e3a"/>
+                <!-- Bass bins - moderate energy -->
+                <rect x="45" y="72" width="18" height="35" fill="#004488" rx="1"/>
+                <rect x="68" y="65" width="18" height="42" fill="#005599" rx="1"/>
+                <rect x="91" y="70" width="18" height="37" fill="#004488" rx="1"/>
+                <rect x="114" y="78" width="18" height="29" fill="#003366" rx="1"/>
+                <rect x="137" y="82" width="18" height="25" fill="#002244" rx="1"/>
+                <rect x="160" y="88" width="18" height="19" fill="#001133" rx="1"/>
+                <rect x="183" y="92" width="18" height="15" fill="#001122" rx="1"/>
+                <rect x="206" y="95" width="18" height="12" fill="#000811" rx="1"/>
+                <rect x="229" y="98" width="18" height="9" fill="#000408" rx="1"/>
+                <text x="150" y="120" fill="#666" font-size="8" text-anchor="middle">20 Hz -------- bass bins -------- 200 Hz</text>
+
+                <!-- Arrow -->
+                <text x="300" y="65" fill="#00d4ff" font-size="16" text-anchor="middle">-</text>
+
+                <!-- Frame N -->
+                <text x="450" y="15" fill="#888" font-size="10" text-anchor="middle">Frame N (current — kick drum!)</text>
+                <rect x="330" y="22" width="240" height="90" rx="4" fill="#0d0d1a" stroke="#1e1e3a"/>
+                <!-- Bass bins - much more energy (kick drum) -->
+                <rect x="345" y="32" width="18" height="75" fill="#0088cc" rx="1"/>
+                <rect x="368" y="28" width="18" height="79" fill="#00aadd" rx="1"/>
+                <rect x="391" y="35" width="18" height="72" fill="#0088cc" rx="1"/>
+                <rect x="414" y="45" width="18" height="62" fill="#006699" rx="1"/>
+                <rect x="437" y="60" width="18" height="47" fill="#004466" rx="1"/>
+                <rect x="460" y="75" width="18" height="32" fill="#003344" rx="1"/>
+                <rect x="483" y="85" width="18" height="22" fill="#002233" rx="1"/>
+                <rect x="506" y="90" width="18" height="17" fill="#001122" rx="1"/>
+                <rect x="529" y="95" width="18" height="12" fill="#000811" rx="1"/>
+                <text x="450" y="120" fill="#666" font-size="8" text-anchor="middle">20 Hz -------- bass bins -------- 200 Hz</text>
+
+                <!-- Energy increase arrows -->
+                <line x1="345" y1="140" x2="345" y2="155" stroke="#00cc88" stroke-width="2" marker-end="url(#arrowhead)"/>
+                <line x1="368" y1="140" x2="368" y2="155" stroke="#00cc88" stroke-width="2" marker-end="url(#arrowhead)"/>
+                <line x1="391" y1="140" x2="391" y2="155" stroke="#00cc88" stroke-width="2" marker-end="url(#arrowhead)"/>
+                <line x1="414" y1="140" x2="414" y2="155" stroke="#00cc88" stroke-width="2" marker-end="url(#arrowhead)"/>
+                <line x1="437" y1="140" x2="437" y2="155" stroke="#00cc88" stroke-width="2" marker-end="url(#arrowhead)"/>
+                <line x1="460" y1="140" x2="460" y2="155" stroke="#00cc88" stroke-width="2" marker-end="url(#arrowhead)"/>
+                <text x="420" y="172" fill="#00cc88" font-size="9" text-anchor="middle">Positive increases only</text>
+
+                <!-- Result -->
+                <rect x="150" y="185" width="300" height="30" rx="6" fill="#00cc8822" stroke="#00cc88"/>
+                <text x="300" y="205" fill="#00cc88" font-size="11" text-anchor="middle">Spectral flux = sum of all positive increases = ONSET</text>
+            </svg>
+        </div>
+
+        <div class="math">
+            <span class="heading">Spectral flux (low-band, half-wave rectified)</span>
+            <span class="var">flux</span>[<span class="var">n</span>] <span class="op">=</span> <span class="fn">Sum</span><sub>(k=bin20Hz to bin200Hz)</sub> <span class="fn">max</span>(<span class="num">0</span>, |<span class="var">X<sub>n</sub></span>[<span class="var">k</span>]| <span class="op">-</span> |<span class="var">X<sub>n-1</sub></span>[<span class="var">k</span>]|)<br>
+            <br>
+            <span class="heading">Where</span>
+            <table>
+                <tr><td>|<span class="var">X<sub>n</sub></span>[<span class="var">k</span>]|</td><td>Magnitude of bin <span class="var">k</span> in the current frame</td></tr>
+                <tr><td>|<span class="var">X<sub>n-1</sub></span>[<span class="var">k</span>]|</td><td>Magnitude of bin <span class="var">k</span> in the previous frame</td></tr>
+                <tr><td><span class="fn">max</span>(<span class="num">0</span>, ...)</td><td>Half-wave rectification: only count <em>increases</em></td></tr>
+                <tr><td>bin20Hz</td><td><span class="fn">floor</span>(<span class="num">20</span> / <span class="num">21.5</span>) <span class="op">=</span> <span class="num">0</span></td></tr>
+                <tr><td>bin200Hz</td><td><span class="fn">floor</span>(<span class="num">200</span> / <span class="num">21.5</span>) <span class="op">=</span> <span class="num">9</span></td></tr>
+            </table>
+            <br>
+            <span class="comment">Only ~10 bins to sum — this is trivially fast.</span><br>
+            <span class="comment">Half-wave rectification is essential: without it, a note ending</span><br>
+            <span class="comment">produces negative flux that cancels real onsets in the same frame.</span>
+        </div>
+
+        <p>The focus on the 20-200 Hz range is deliberate. Kick drums — the rhythmic backbone of most music — concentrate their energy in the 40-100 Hz range. Snare drums have significant energy here too (the body resonance, not just the snap). By ignoring higher frequencies, we avoid false onsets from melodic movement, vocal articulation, and cymbal splashes that do not define the beat.</p>
+
+        <h3>Onset Detection: Adaptive Thresholding</h3>
+
+        <p>A raw flux value is meaningless without context. A flux of 50 could be a massive onset in a quiet passage or background noise in a loud one. The threshold must adapt to the recent history of flux values.</p>
+
+        <div class="mermaid">
+            graph TD
+                AF["Audio Frame"] --> LE["Low-band Magnitude<br/>bins 0-9 (20-200Hz)"]
+                LE --> SF["Spectral Flux<br/>sum of positive changes"]
+                SF --> CB["Circular Buffer<br/>~10 sec history (~210 values)"]
+                CB --> STATS["Compute mean + std dev<br/>of flux history"]
+                STATS --> AT["Adaptive Threshold<br/>mean + 1.5 x sigma"]
+                AT --> CMP{"flux > threshold<br/>AND >100ms since<br/>last onset?"}
+                CMP -->|Yes| ONSET["ONSET DETECTED<br/>record timestamp"]
+                CMP -->|No| SKIP["No onset"]
+                ONSET --> TSB["Timestamp Buffer<br/>recent onset times"]
+        </div>
+
+        <div class="math">
+            <span class="heading">Adaptive threshold</span>
+            <span class="var">threshold</span>[<span class="var">n</span>] <span class="op">=</span> <span class="var">mean</span>(<span class="var">fluxHistory</span>) <span class="op">+</span> <span class="num">1.5</span> <span class="op">x</span> <span class="var">stddev</span>(<span class="var">fluxHistory</span>)<br>
+            <br>
+            <span class="heading">Parameters</span>
+            <table>
+                <tr><td>History length</td><td><span class="num">~210 frames</span> (~10 seconds at 21fps)</td></tr>
+                <tr><td>Multiplier</td><td><span class="num">1.5</span> standard deviations above mean</td></tr>
+                <tr><td>Minimum gap</td><td><span class="num">100 ms</span> between onsets (prevents double-triggers)</td></tr>
+            </table>
+            <br>
+            <span class="comment">The 1.5 sigma threshold means only flux values in the top ~7% of</span><br>
+            <span class="comment">the recent distribution are counted as onsets. This automatically</span><br>
+            <span class="comment">adapts to loud vs quiet passages, fast vs slow music, and</span><br>
+            <span class="comment">different genres without any manual calibration.</span>
+        </div>
+
+        <p>The minimum gap of 100 ms corresponds to 600 BPM — far faster than any real music. Its purpose is to prevent a single drum hit, which may cause elevated flux for 2-3 consecutive frames, from being counted as multiple onsets.</p>
+
+        <div class="inline-diagram">
+            <svg width="600" height="200" viewBox="0 0 600 200">
+                <!-- Axes -->
+                <line x1="50" y1="160" x2="570" y2="160" stroke="#1e1e3a" stroke-width="1"/>
+                <line x1="50" y1="160" x2="50" y2="20" stroke="#1e1e3a" stroke-width="1"/>
+                <text x="310" y="190" fill="#888" font-size="10" text-anchor="middle">Time</text>
+                <text x="25" y="90" fill="#888" font-size="10" text-anchor="middle" transform="rotate(-90,25,90)">Spectral Flux</text>
+
+                <!-- Flux signal (spiky with periodic peaks) -->
+                <path d="M60,145 L75,140 L85,142 L95,138 L105,50 L115,135 L125,140 L135,138 L145,142 L160,140 L170,55 L180,137 L190,142 L200,140 L210,138 L220,143 L235,140 L245,45 L255,138 L265,141 L275,139 L285,142 L300,140 L310,48 L320,136 L330,141 L340,138 L350,142 L365,139 L375,52 L385,137 L395,141 L405,139 L415,143 L430,140 L440,42 L450,138 L460,142 L470,139 L480,141 L495,140 L505,55 L515,138 L525,142 L535,140 L545,143 L555,141" fill="none" stroke="#4488ff" stroke-width="1.5"/>
+
+                <!-- Adaptive threshold line -->
+                <line x1="60" y1="100" x2="555" y2="100" stroke="#ffcc00" stroke-width="1.5" stroke-dasharray="6,4"/>
+                <text x="565" y="104" fill="#ffcc00" font-size="9">threshold</text>
+                <text x="565" y="116" fill="#888" font-size="8">mean + 1.5 sigma</text>
+
+                <!-- Onset markers (where flux crosses threshold) -->
+                <line x1="105" y1="165" x2="105" y2="175" stroke="#00cc88" stroke-width="2"/>
+                <circle cx="105" cy="50" r="4" fill="#00cc88"/>
+                <line x1="170" y1="165" x2="170" y2="175" stroke="#00cc88" stroke-width="2"/>
+                <circle cx="170" cy="55" r="4" fill="#00cc88"/>
+                <line x1="245" y1="165" x2="245" y2="175" stroke="#00cc88" stroke-width="2"/>
+                <circle cx="245" cy="45" r="4" fill="#00cc88"/>
+                <line x1="310" y1="165" x2="310" y2="175" stroke="#00cc88" stroke-width="2"/>
+                <circle cx="310" cy="48" r="4" fill="#00cc88"/>
+                <line x1="375" y1="165" x2="375" y2="175" stroke="#00cc88" stroke-width="2"/>
+                <circle cx="375" cy="52" r="4" fill="#00cc88"/>
+                <line x1="440" y1="165" x2="440" y2="175" stroke="#00cc88" stroke-width="2"/>
+                <circle cx="440" cy="42" r="4" fill="#00cc88"/>
+                <line x1="505" y1="165" x2="505" y2="175" stroke="#00cc88" stroke-width="2"/>
+                <circle cx="505" cy="55" r="4" fill="#00cc88"/>
+
+                <!-- Interval annotation -->
+                <line x1="105" y1="178" x2="170" y2="178" stroke="#cc88ff" stroke-width="1"/>
+                <line x1="170" y1="178" x2="245" y2="178" stroke="#cc88ff" stroke-width="1"/>
+                <text x="137" y="196" fill="#cc88ff" font-size="8" text-anchor="middle">interval</text>
+                <text x="207" y="196" fill="#cc88ff" font-size="8" text-anchor="middle">interval</text>
+
+                <!-- Legend -->
+                <circle cx="75" cy="22" r="3" fill="#00cc88"/>
+                <text x="85" y="26" fill="#00cc88" font-size="9">Detected onsets</text>
+                <line x1="200" y1="22" x2="220" y2="22" stroke="#ffcc00" stroke-width="1.5" stroke-dasharray="4"/>
+                <text x="225" y="26" fill="#ffcc00" font-size="9">Adaptive threshold</text>
+            </svg>
+        </div>
+
+        <h3>Tempo Estimation: Autocorrelation of the Onset Strength Signal</h3>
+
+        <p>An earlier approach tracked inter-onset intervals (IOIs) from spectral flux peaks: collect onset timestamps, compute the gaps, take the median, convert to BPM. This worked well for straight 4/4 beats but failed completely on syncopated music like drum &amp; bass, where kick drums hit on off-beat subdivisions. The IOI histogram scattered across many wrong tempos (50, 67, 84, 100 BPM) when the true tempo was 123 BPM.</p>
+
+        <p>The solution, based on Scheirer (1998) and Ellis (2007), is to autocorrelate the <strong>continuous spectral flux signal itself</strong> rather than individual onset timestamps. The key insight: even when individual kicks are syncopated, the overall rhythmic <em>pattern</em> repeats at the beat period. Autocorrelation finds this periodicity directly.</p>
+
+        <div class="math">
+            <span class="heading">Onset signal pipeline (per audio callback)</span>
+            <span class="comment">1. Compute 4 overlapping 1024-point FFTs (hop=1024) → ~43fps onset rate</span><br>
+            <span class="comment">2. For each FFT: broadband spectral flux (positive magnitude changes)</span><br>
+            <span class="comment">3. Log compress: flux → log(1 + 10 * flux)</span><br>
+            <span class="comment">4. Store in 340-frame circular buffer (~8 seconds at ~43fps)</span><br>
+            <br>
+            <span class="heading">Autocorrelation (every ~0.5s)</span>
+            <span class="comment">5. Linearise circular buffer</span><br>
+            <span class="comment">6. Detrend: subtract 2-second local mean (removes slow energy changes)</span><br>
+            <span class="comment">7. Half-wave rectify after detrending</span><br>
+            <span class="comment">8. Normalise to zero mean, unit variance (vDSP_normalize)</span><br>
+            <span class="comment">9. Autocorrelate via vDSP_dotpr for each lag in 90-200 BPM range</span><br>
+            <span class="comment">10. Find peak lag; harmonic check at lag/2 (>50% → prefer double tempo)</span><br>
+            <span class="comment">11. Parabolic interpolation for sub-lag accuracy</span><br>
+            <span class="comment">12. Auto-double below 90 BPM, auto-halve above 200 BPM</span><br>
+            <br>
+            <span class="heading">Lag range (at ~40fps onset rate on device)</span>
+            <span class="var">minLag</span> <span class="op">=</span> <span class="num">40</span> <span class="op">*</span> <span class="num">60</span> / <span class="num">160</span> <span class="op">=</span> <span class="result">15</span> <span class="comment">(160 BPM)</span><br>
+            <span class="var">maxLag</span> <span class="op">=</span> <span class="num">40</span> <span class="op">*</span> <span class="num">60</span> / <span class="num">90</span> &nbsp;<span class="op">=</span> <span class="result">27</span> <span class="comment">(90 BPM)</span><br>
+            <br>
+            <span class="heading">Display range: 70–160 BPM</span>
+            <span class="comment">Auto-halve above 160 (e.g. D&B at 174 → 87 perceived tempo)</span><br>
+            <span class="comment">Auto-double below 70 (rare)</span><br>
+            <br>
+            <span class="heading">Example: 123 BPM ("Missing" by Everything but the Girl)</span>
+            <span class="comment">Expected lag = 40 * 60 / 123 = 19.5</span><br>
+            <span class="comment">Peak at lag 19, parabolic interpolation refines to ~19.3</span><br>
+            <span class="comment">BPM = 60 * 40 / 19.3 = 124 BPM (within 1 BPM of true tempo)</span><br>
+            <br>
+            <span class="heading">Example: 120 BPM (BBC News24 Countdown)</span>
+            <span class="comment">Peak at lag 20, refined to 19.98</span><br>
+            <span class="comment">BPM = 60 * 40 / 19.98 = 120.1 BPM (confidence 60%)</span>
+        </div>
+
+        <p><strong>Why log compression matters:</strong> Raw spectral flux has enormous dynamic range — a loud kick produces flux 100x larger than a quiet hi-hat. Without compression, the autocorrelation is dominated by a few loud events. Log compression (<code>log(1 + 10x)</code>) brings quiet hi-hat onsets to comparable magnitude with loud kicks, making the rhythmic pattern visible across all dynamic levels.</p>
+
+        <p><strong>Why detrending matters:</strong> Slow energy variations (a crescendo, a quiet intro with harmonic content) create a DC component in the onset signal that produces positive autocorrelation at all lags — resulting in false BPM readings during non-rhythmic passages. Subtracting the 2-second local mean removes these slow variations while preserving the fast rhythmic peaks.</p>
+
+        <p><strong>Confidence metric:</strong> The ratio of the peak autocorrelation value to the zero-lag (self-correlation) value, after normalisation. The display threshold is 15%. On real music, confidence typically ranges from 37-60% during steady beats — "Missing" at 37-47%, BBC News24 Countdown at 58-61%.</p>
+
+        <p><strong>Temporal smoothing:</strong> A smoothing buffer of 3 consecutive estimates requires 2 out of 3 to agree within &plusmn;5 BPM before the displayed value changes. This prevents brief transient blips from reaching the UI while allowing faster lock-on (~1.5 seconds).</p>
+
+        <p><strong>Silence suppression:</strong> When the raw flux variance (before detrending) falls below 0.5, no BPM is displayed. This prevents false readings during steady tones and silence where any autocorrelation peak is noise, not rhythm.</p>
+
+        <p><strong>Harmonic check with range constraint:</strong> After finding the peak lag, the algorithm checks if the half-lag (double tempo) has an autocorrelation peak &gt; 40% as strong. If so AND the resulting BPM would be &le; 160, the half-lag is preferred. The range constraint prevents incorrect doubling — e.g. a 124 BPM peak at lag 19 must not be doubled to 248 BPM (lag 9) just because lag 9 has some correlation. Results above 160 BPM are auto-halved for display (e.g. D&amp;B at 174 shows as 87).</p>
+
+        <p><strong>Tempo-change detection:</strong> If 3 consecutive autocorrelation estimates diverge by more than 10 BPM from the currently locked tempo, the entire flux history, smoothing buffer, and onset state are flushed. The detector restarts fresh, typically converging on the correct new tempo within 5-8 seconds. Without this, a wrong initial lock or a track change would persist for 8+ seconds because stale data in the circular buffer keeps reinforcing the old answer. This mirrors the pitch-jump detection in the tuner, which flushes its smoothing buffer when the detected note changes by more than a semitone.</p>
+
+        <p><strong>Tested accuracy across 16 commercial tracks:</strong> 14 out of 16 tracks detected within &plusmn;2 BPM (87.5% accuracy). The algorithm handles a wide range of genres and tempos: Get Lucky (116&rarr;116), Sledgehammer (96&rarr;97), Rock DJ (103&rarr;104), Down Under (107&rarr;108), Running Up That Hill (108&rarr;109), Relax (115&rarr;115), Don't You Want Me (118&rarr;119), BBC News24 (120&rarr;120), Sussudio (121&rarr;121), One More Time (122&rarr;123), Missing (123&rarr;124), Rhythm of the Night (128&rarr;127), Canned Heat (128&rarr;128), Video Killed the Radio Star (132&rarr;131).</p>
+
+        <div class="math">
+            <span class="heading">Why autocorrelation handles syncopation</span>
+            <span class="comment">A D&B kick pattern at 123 BPM:</span><br>
+            <span class="comment">  Kicks on beats 1, 2.5, 4 of each bar (syncopated)</span><br>
+            <span class="comment">  IOI approach: intervals = 0.73s, 0.49s, 0.73s, 0.49s...</span><br>
+            <span class="comment">  IOI median = 0.61s = 98 BPM (WRONG)</span><br>
+            <br>
+            <span class="comment">  Autocorrelation approach: the 3-kick pattern repeats every bar</span><br>
+            <span class="comment">  Strong autocorrelation peak at lag = bar period = 4 beats</span><br>
+            <span class="comment">  Also peak at lag = beat period (the underlying pulse)</span><br>
+            <span class="comment">  Correct BPM extracted from the beat-period peak</span>
+        </div>
+
+        <h3>Beat Flash Visualisation</h3>
+
+        <p>Detected beats are communicated visually through a brief brightness flash on the spectrum visualisation — a subtle but satisfying pulse that confirms the algorithm is tracking the rhythm. The flash is designed to feel instantaneous and natural, like a light reacting to a drum hit.</p>
+
+        <div class="inline-diagram">
+            <svg width="500" height="160" viewBox="0 0 500 160">
+                <!-- Axes -->
+                <line x1="60" y1="120" x2="440" y2="120" stroke="#1e1e3a" stroke-width="1"/>
+                <line x1="60" y1="120" x2="60" y2="20" stroke="#1e1e3a" stroke-width="1"/>
+                <text x="250" y="150" fill="#888" font-size="10" text-anchor="middle">Frames at 60fps (16.6ms each)</text>
+                <text x="35" y="70" fill="#888" font-size="10" text-anchor="middle" transform="rotate(-90,35,70)">Brightness boost</text>
+
+                <!-- Y axis labels -->
+                <text x="55" y="45" fill="#666" font-size="8" text-anchor="end">+0.15</text>
+                <text x="55" y="123" fill="#666" font-size="8" text-anchor="end">0</text>
+                <line x1="58" y1="40" x2="62" y2="40" stroke="#1e1e3a" stroke-width="1"/>
+
+                <!-- Flash envelope: instant rise, 6-frame hold, instant off -->
+                <!-- Onset at frame 0 -->
+                <line x1="80" y1="120" x2="80" y2="40" stroke="#00d4ff" stroke-width="2.5"/>
+                <!-- Hold for 6 frames -->
+                <line x1="80" y1="40" x2="176" y2="40" stroke="#00d4ff" stroke-width="2.5"/>
+                <!-- Instant off -->
+                <line x1="176" y1="40" x2="176" y2="120" stroke="#00d4ff" stroke-width="2.5"/>
+                <!-- Baseline -->
+                <line x1="176" y1="120" x2="300" y2="120" stroke="#00d4ff" stroke-width="2.5"/>
+
+                <!-- Second beat -->
+                <line x1="300" y1="120" x2="300" y2="40" stroke="#00d4ff" stroke-width="2.5"/>
+                <line x1="300" y1="40" x2="396" y2="40" stroke="#00d4ff" stroke-width="2.5"/>
+                <line x1="396" y1="40" x2="396" y2="120" stroke="#00d4ff" stroke-width="2.5"/>
+                <line x1="396" y1="120" x2="440" y2="120" stroke="#00d4ff" stroke-width="2.5"/>
+
+                <!-- Frame ticks -->
+                <line x1="80" y1="120" x2="80" y2="125" stroke="#334" stroke-width="1"/>
+                <line x1="96" y1="120" x2="96" y2="125" stroke="#334" stroke-width="1"/>
+                <line x1="112" y1="120" x2="112" y2="125" stroke="#334" stroke-width="1"/>
+                <line x1="128" y1="120" x2="128" y2="125" stroke="#334" stroke-width="1"/>
+                <line x1="144" y1="120" x2="144" y2="125" stroke="#334" stroke-width="1"/>
+                <line x1="160" y1="120" x2="160" y2="125" stroke="#334" stroke-width="1"/>
+                <line x1="176" y1="120" x2="176" y2="125" stroke="#334" stroke-width="1"/>
+
+                <!-- Labels -->
+                <text x="80" y="138" fill="#00cc88" font-size="8" text-anchor="middle">onset</text>
+                <text x="128" y="33" fill="#888" font-size="8" text-anchor="middle">6 frames = 100ms</text>
+                <text x="176" y="138" fill="#888" font-size="8" text-anchor="middle">off</text>
+                <text x="300" y="138" fill="#00cc88" font-size="8" text-anchor="middle">onset</text>
+            </svg>
+        </div>
+
+        <div class="math">
+            <span class="heading">Beat flash implementation</span>
+            <span class="comment">On onset detection:</span><br>
+            &nbsp;&nbsp;<span class="var">beatFlash</span> <span class="op">=</span> <span class="num">true</span><br>
+            &nbsp;&nbsp;<span class="var">beatFlashCounter</span> <span class="op">=</span> <span class="num">6</span> <span class="comment">&nbsp;&nbsp;(frames at 60fps = 100 ms)</span><br>
+            <br>
+            <span class="comment">In MetalRenderer.draw(), per frame:</span><br>
+            <span class="comment">if</span> <span class="var">beatFlash</span>:<br>
+            &nbsp;&nbsp;<span class="comment">for each vertex colour</span> (<span class="var">r</span>, <span class="var">g</span>, <span class="var">b</span>):<br>
+            &nbsp;&nbsp;&nbsp;&nbsp;<span class="var">r</span> <span class="op">+=</span> <span class="num">0.15</span>, &nbsp;<span class="var">g</span> <span class="op">+=</span> <span class="num">0.15</span>, &nbsp;<span class="var">b</span> <span class="op">+=</span> <span class="num">0.15</span><br>
+            &nbsp;&nbsp;<span class="var">beatFlashCounter</span> <span class="op">-=</span> <span class="num">1</span><br>
+            &nbsp;&nbsp;<span class="comment">if</span> <span class="var">beatFlashCounter</span> <span class="op">==</span> <span class="num">0</span>: &nbsp;<span class="var">beatFlash</span> <span class="op">=</span> <span class="num">false</span><br>
+            <br>
+            <span class="comment">The +0.15 RGB boost is additive, not multiplicative — even dark</span><br>
+            <span class="comment">bass bars (which have low base brightness) become visibly brighter.</span><br>
+            <span class="comment">Values are clamped to [0, 1] by the GPU's fragment output.</span>
+        </div>
+
+        <h3>Performance Budget</h3>
+
+        <p>Beat detection runs alongside the existing FFT visualisation pipeline and the optional pitch detection. The key question is whether the combined DSP load fits comfortably within the audio callback budget.</p>
+
+        <div class="inline-diagram">
+            <svg width="520" height="200" viewBox="0 0 520 200">
+                <!-- Title -->
+                <text x="260" y="18" fill="#888" font-size="11" text-anchor="middle">DSP Time Budget per Audio Frame</text>
+
+                <!-- Budget bar (full width = 46.4ms) -->
+                <rect x="40" y="30" width="440" height="24" rx="4" fill="#1a1a2a" stroke="#1e1e3a"/>
+                <text x="260" y="46" fill="#334" font-size="9" text-anchor="middle">46.4 ms budget (2048 samples at 44.1 kHz)</text>
+
+                <!-- Actual usage bar (tiny sliver) -->
+                <rect x="40" y="65" width="440" height="30" rx="4" fill="#0d0d1a" stroke="#1e1e3a"/>
+
+                <!-- Visualiser FFT pipeline: ~10us -->
+                <rect x="42" y="67" width="4" height="26" fill="#4488ff" rx="1"/>
+                <!-- Pitch detection: ~7us -->
+                <rect x="47" y="67" width="3" height="26" fill="#00cc88" rx="1"/>
+                <!-- Beat detection: ~3us -->
+                <rect x="51" y="67" width="2" height="26" fill="#cc88ff" rx="1"/>
+
+                <!-- Zoomed view -->
+                <text x="260" y="115" fill="#888" font-size="10" text-anchor="middle">Zoomed: actual DSP usage (~20 us total)</text>
+                <rect x="40" y="125" width="440" height="35" rx="4" fill="#0d0d1a" stroke="#1e1e3a"/>
+
+                <!-- Zoomed bars -->
+                <rect x="42" y="128" width="180" height="29" fill="#4488ff55" stroke="#4488ff" rx="2"/>
+                <text x="132" y="147" fill="#aaddff" font-size="9" text-anchor="middle">Visualiser FFT: ~10 us</text>
+
+                <rect x="224" y="128" width="130" height="29" fill="#00cc8855" stroke="#00cc88" rx="2"/>
+                <text x="289" y="147" fill="#aaffcc" font-size="9" text-anchor="middle">Pitch: ~7 us</text>
+
+                <rect x="356" y="128" width="55" height="29" fill="#cc88ff55" stroke="#cc88ff" rx="2"/>
+                <text x="383" y="147" fill="#ddaaff" font-size="9" text-anchor="middle">Beat: ~3 us</text>
+
+                <!-- Remaining -->
+                <rect x="413" y="128" width="65" height="29" fill="#1a1a2a" stroke="#334" rx="2" stroke-dasharray="3"/>
+                <text x="445" y="147" fill="#555" font-size="8" text-anchor="middle">idle</text>
+
+                <!-- Summary -->
+                <text x="260" y="182" fill="#c0c0d0" font-size="10" text-anchor="middle">Total DSP: ~20 us &nbsp;|&nbsp; Budget: 46,400 us &nbsp;|&nbsp; Utilisation: 0.04%</text>
+                <text x="260" y="197" fill="#00cc88" font-size="10" text-anchor="middle">~2,300x headroom — all three features run comfortably on a single core</text>
+            </svg>
+        </div>
+
+        <div class="math">
+            <span class="heading">Beat detection timing breakdown</span>
+            <table>
+                <tr><th>Operation</th><th>Per-frame cost</th><th>Notes</th></tr>
+                <tr><td>Previous spectrum copy</td><td><span class="num">~0.2 us</span></td><td>memcpy of 10 floats (40 bytes)</td></tr>
+                <tr><td>Spectral flux</td><td><span class="num">~0.3 us</span></td><td>10 subtracts + max + sum</td></tr>
+                <tr><td>Threshold update</td><td><span class="num">~1.5 us</span></td><td>mean + stddev over ~210 values</td></tr>
+                <tr><td>Onset decision</td><td><span class="num">~0.1 us</span></td><td>comparison + timestamp record</td></tr>
+                <tr><td>Onset FFTs (1024-pt x4)</td><td><span class="num">~600 us</span></td><td>4 overlapping 1024-point FFTs per callback at hop=1024</td></tr>
+                <tr><td>BPM estimation</td><td><span class="num">~50 us</span></td><td>autocorrelation (~40 lags x 340 samples), every ~0.5s</td></tr>
+                <tr><td style="border-top: 1px solid #334"><span class="result">Total</span></td><td><span class="result">~3 us</span></td><td></td></tr>
+            </table>
+            <br>
+            <span class="heading">Combined DSP pipeline</span>
+            <table>
+                <tr><th>Component</th><th>Time</th><th>% of budget</th></tr>
+                <tr><td style="color:#4488ff">FFT visualisation pipeline</td><td><span class="num">~10 us</span></td><td><span class="num">0.022%</span></td></tr>
+                <tr><td style="color:#00cc88">Pitch detection (autocorrelation + peak search)</td><td><span class="num">~7 us</span></td><td><span class="num">0.015%</span></td></tr>
+                <tr><td style="color:#cc88ff">Beat detection (onset FFTs + BPM)</td><td><span class="num">~650 us</span></td><td><span class="num">1.4%</span></td></tr>
+                <tr><td style="border-top: 1px solid #334"><span class="result">Total</span></td><td><span class="result">~20 us</span></td><td><span class="result">0.04%</span></td></tr>
+            </table>
+            <br>
+            <span class="comment">At 0.04% utilisation, all three DSP features could run simultaneously</span><br>
+            <span class="comment">on a processor 2,000x slower and still meet the real-time deadline.</span>
+        </div>
+    </div>
+
+    <div class="deep-dive">
+        <h2>Part 6: 3D Surface Rendering</h2>
+
+        <p>The first four visualisation modes (bars, curve, circular, spectrogram) are all 2D — they plot frequency data in screen space using flat coloured triangles. The surface mode adds a third dimension: time flows into the screen as a scrolling mesh, with amplitude forming a terrain-like surface lit by a directional light. This requires a fundamentally different rendering pipeline.</p>
+
+        <h3>Dual Pipeline Architecture</h3>
+
+        <p>A natural question: why not extend the existing 2D pipeline to handle 3D as well? The answer comes down to vertex bandwidth. The 2D modes process up to <strong>100,000 vertices per frame</strong>, each at 32 bytes (position <code>SIMD2&lt;Float&gt;</code> + colour <code>SIMD4&lt;Float&gt;</code>). Adding normals for lighting would inflate every vertex to 48 bytes — an extra 1.6MB of GPU bandwidth per frame — even though the 2D modes never use normals. Conversely, the 3D surface mode processes ~45,000 vertices (or ~91,000 with ridgelines in surface+ mode) but needs normals for lighting and a uniform buffer for the model-view-projection matrix, neither of which the 2D pipeline requires.</p>
+
+        <p>The clean solution is <strong>two separate <code>MTLRenderPipelineState</code> objects</strong>, each with its own vertex descriptor and shader pair. They share the same <code>MTKView</code> and command queue — only the pipeline state and vertex buffer format differ.</p>
+
+        <div class="mermaid">
+            graph TD
+                SD[Spectrum Data<br/>128 bands] --> TwoD[2D Modes<br/>Bars / Curve / Circular / Spectrogram]
+                SD --> ThreeD[Surface Mode]
+                TwoD --> SV[SpectrumVertex<br/>position: float2 + color: float4<br/>32 bytes]
+                ThreeD --> SV3[SurfaceVertex<br/>position: float3 + normal: float3 + color: float4<br/>48 bytes]
+                SV --> P2D[2D Pipeline State]
+                SV3 --> P3D[3D Pipeline State + Depth Buffer]
+                P2D --> GPU[GPU Rasteriser]
+                P3D --> GPU
+
+                style SD fill:#1a1a3e,stroke:#00d4ff,color:#e0e0f0
+                style TwoD fill:#1a2a1a,stroke:#00cc88,color:#e0e0f0
+                style ThreeD fill:#1a1a3e,stroke:#cc88ff,color:#e0e0f0
+                style SV fill:#0d0d1a,stroke:#4488ff,color:#aaddff
+                style SV3 fill:#0d0d1a,stroke:#cc88ff,color:#ddaaff
+                style P2D fill:#1a2a1a,stroke:#00cc88,color:#e0e0f0
+                style P3D fill:#1a1a3e,stroke:#cc88ff,color:#e0e0f0
+                style GPU fill:#2a1a0a,stroke:#ff6b35,color:#e0e0f0
+        </div>
+
+        <p>Both pipelines are created once at init time. Each frame, the renderer checks the current mode and selects the appropriate pipeline state, vertex buffer, and draw call. The 2D pipeline uses no depth buffer (painter's algorithm with draw order). The 3D pipeline enables depth testing and writes to a depth texture attached to the render pass.</p>
+
+        <h3>3D Vertex Structure</h3>
+
+        <p>The surface vertex layout is driven by Metal's alignment requirements. Metal's <code>float3</code> and Swift's <code>SIMD3&lt;Float&gt;</code> both occupy <strong>16 bytes</strong> (12 bytes of data, 4 bytes of padding to align to 16-byte boundaries). This alignment is mandatory — mismatched strides between Swift and Metal cause garbled geometry.</p>
+
+        <div class="math">
+            <span class="heading">SurfaceVertex memory layout</span>
+            <table>
+                <tr><th>Field</th><th>Swift Type</th><th>Metal Type</th><th>Size</th><th>Offset</th></tr>
+                <tr><td><span class="var">position</span></td><td>SIMD3&lt;Float&gt;</td><td>float3</td><td><span class="num">16B</span></td><td><span class="num">0</span></td></tr>
+                <tr><td><span class="var">normal</span></td><td>SIMD3&lt;Float&gt;</td><td>float3</td><td><span class="num">16B</span></td><td><span class="num">16</span></td></tr>
+                <tr><td><span class="var">color</span></td><td>SIMD4&lt;Float&gt;</td><td>float4</td><td><span class="num">16B</span></td><td><span class="num">32</span></td></tr>
+                <tr><td style="border-top: 1px solid #334"><span class="result">Total stride</span></td><td></td><td></td><td><span class="result">48B</span></td><td></td></tr>
+            </table>
+            <br>
+            <span class="comment">Compare with 2D: SpectrumVertex = float2 (8B, padded to 16B) + float4 (16B) = 32B stride</span><br>
+            <span class="comment">The extra 16B per vertex for normals is the cost of lighting.</span>
+        </div>
+
+        <h3>MVP Matrix Construction</h3>
+
+        <p>The 3D surface uses an <strong>orbit camera</strong> — the camera sits on the surface of a sphere centred on the origin, parameterised by azimuth (horizontal angle), elevation (vertical angle), and distance. The user's view is fixed (no interactive rotation), but the camera position is computed dynamically to adapt to different aspect ratios.</p>
+
+        <div class="math">
+            <span class="heading">Eye position from spherical coordinates</span>
+            <span class="var">eyeX</span> <span class="op">=</span> <span class="var">distance</span> <span class="op">*</span> <span class="fn">cos</span>(<span class="var">elevation</span>) <span class="op">*</span> <span class="fn">sin</span>(<span class="var">azimuth</span>)<br>
+            <span class="var">eyeY</span> <span class="op">=</span> <span class="var">distance</span> <span class="op">*</span> <span class="fn">sin</span>(<span class="var">elevation</span>)<br>
+            <span class="var">eyeZ</span> <span class="op">=</span> <span class="var">distance</span> <span class="op">*</span> <span class="fn">cos</span>(<span class="var">elevation</span>) <span class="op">*</span> <span class="fn">cos</span>(<span class="var">azimuth</span>)<br>
+            <br>
+            <span class="heading">View matrix (lookAt)</span>
+            <span class="var">forward</span> <span class="op">=</span> <span class="fn">normalize</span>(<span class="var">target</span> <span class="op">-</span> <span class="var">eye</span>)<br>
+            <span class="var">right</span> <span class="op">=</span> <span class="fn">normalize</span>(<span class="var">forward</span> <span class="op">×</span> <span class="var">up</span>)<br>
+            <span class="var">correctedUp</span> <span class="op">=</span> <span class="var">right</span> <span class="op">×</span> <span class="var">forward</span><br>
+            <br>
+            <span class="heading">Projection matrix (perspective)</span>
+            <span class="var">fovY</span> <span class="op">=</span> <span class="num">45 degrees</span><br>
+            <span class="var">near</span> <span class="op">=</span> <span class="num">0.1</span>, &nbsp;<span class="var">far</span> <span class="op">=</span> <span class="num">100.0</span><br>
+            <span class="var">M</span> <span class="op">=</span> <span class="var">projection</span> <span class="op">*</span> <span class="var">view</span> <span class="op">*</span> <span class="var">model</span><br>
+            <br>
+            <span class="comment">The model matrix is identity — the mesh is generated directly in world space.</span><br>
+            <span class="comment">MVP is passed to the vertex shader via a uniform buffer (buffer index 1).</span>
+        </div>
+
+        <h3>Aspect-Ratio-Adaptive Camera</h3>
+
+        <p>The Metal view's height changes depending on the UI state: full height in mic mode, reduced height when the transport bar is visible, and further reduced when the music browser is open. This means the aspect ratio varies significantly. A fixed camera that looks good in one state clips the mesh or leaves dead space in another.</p>
+
+        <p>The solution is <strong>two camera presets</strong> — one tuned for tall/narrow views (compact mode, closer camera, steeper elevation) and one for wide/short views (full mode, farther camera, shallower elevation). The actual camera parameters are smoothly interpolated between these presets based on the current aspect ratio.</p>
+
+        <div class="inline-diagram">
+            <svg width="520" height="220" viewBox="0 0 520 220">
+                <!-- Title -->
+                <text x="260" y="18" fill="#888" font-size="11" text-anchor="middle">Camera Interpolation by Aspect Ratio</text>
+
+                <!-- X axis -->
+                <line x1="60" y1="170" x2="460" y2="170" stroke="#1e1e3a" stroke-width="1"/>
+                <text x="260" y="195" fill="#888" font-size="10" text-anchor="middle">Aspect Ratio (width / height)</text>
+
+                <!-- Y axis -->
+                <line x1="60" y1="40" x2="60" y2="170" stroke="#1e1e3a" stroke-width="1"/>
+                <text x="25" y="105" fill="#888" font-size="10" text-anchor="middle" transform="rotate(-90, 25, 105)">Blend Factor</text>
+
+                <!-- Tick marks -->
+                <text x="60" y="185" fill="#666" font-size="9" text-anchor="middle">0.4</text>
+                <text x="160" y="185" fill="#666" font-size="9" text-anchor="middle">0.55</text>
+                <text x="310" y="185" fill="#666" font-size="9" text-anchor="middle">0.75</text>
+                <text x="460" y="185" fill="#666" font-size="9" text-anchor="middle">1.0</text>
+                <line x1="160" y1="168" x2="160" y2="172" stroke="#666" stroke-width="1"/>
+                <line x1="310" y1="168" x2="310" y2="172" stroke="#666" stroke-width="1"/>
+
+                <!-- Y labels -->
+                <text x="52" y="174" fill="#666" font-size="9" text-anchor="end">0</text>
+                <text x="52" y="47" fill="#666" font-size="9" text-anchor="end">1</text>
+
+                <!-- Compact zone (flat at 0) -->
+                <line x1="60" y1="170" x2="160" y2="170" stroke="#00cc88" stroke-width="2.5"/>
+
+                <!-- Interpolation zone (diagonal) -->
+                <line x1="160" y1="170" x2="310" y2="44" stroke="#00d4ff" stroke-width="2.5"/>
+
+                <!-- Full zone (flat at 1) -->
+                <line x1="310" y1="44" x2="460" y2="44" stroke="#cc88ff" stroke-width="2.5"/>
+
+                <!-- Zone labels -->
+                <text x="110" y="155" fill="#00cc88" font-size="10" text-anchor="middle">Compact</text>
+                <text x="110" y="140" fill="#00cc88" font-size="9" text-anchor="middle">(browser open)</text>
+                <text x="235" y="98" fill="#00d4ff" font-size="10" text-anchor="middle">Blend</text>
+                <text x="385" y="37" fill="#cc88ff" font-size="10" text-anchor="middle">Full</text>
+                <text x="385" y="57" fill="#cc88ff" font-size="9" text-anchor="middle">(mic mode)</text>
+
+                <!-- Dashed boundary lines -->
+                <line x1="160" y1="40" x2="160" y2="168" stroke="#00d4ff" stroke-width="1" stroke-dasharray="4"/>
+                <line x1="310" y1="46" x2="310" y2="168" stroke="#00d4ff" stroke-width="1" stroke-dasharray="4"/>
+            </svg>
+        </div>
+
+        <div class="math">
+            <span class="heading">Interpolation parameters</span>
+            <span class="var">aspect</span> <span class="op">=</span> <span class="var">viewWidth</span> <span class="op">/</span> <span class="var">viewHeight</span><br>
+            <br>
+            <span class="comment">Below 0.55: use compact preset (closer, steeper)</span><br>
+            <span class="comment">Above 0.75: use full preset (farther, shallower)</span><br>
+            <span class="comment">Between 0.55 and 0.75: linear interpolation</span><br>
+            <br>
+            <span class="var">t</span> <span class="op">=</span> <span class="fn">clamp</span>((<span class="var">aspect</span> <span class="op">-</span> <span class="num">0.55</span>) <span class="op">/</span> (<span class="num">0.75</span> <span class="op">-</span> <span class="num">0.55</span>), &nbsp;<span class="num">0</span>, &nbsp;<span class="num">1</span>)<br>
+            <br>
+            <span class="var">distance</span> <span class="op">=</span> <span class="fn">lerp</span>(<span class="var">compact.distance</span>, &nbsp;<span class="var">full.distance</span>, &nbsp;<span class="var">t</span>)<br>
+            <span class="var">elevation</span> <span class="op">=</span> <span class="fn">lerp</span>(<span class="var">compact.elevation</span>, &nbsp;<span class="var">full.elevation</span>, &nbsp;<span class="var">t</span>)<br>
+            <span class="var">azimuth</span> <span class="op">=</span> <span class="fn">lerp</span>(<span class="var">compact.azimuth</span>, &nbsp;<span class="var">full.azimuth</span>, &nbsp;<span class="var">t</span>)<br>
+            <span class="var">yScale</span> <span class="op">=</span> <span class="fn">lerp</span>(<span class="var">compact.yScale</span>, &nbsp;<span class="var">full.yScale</span>, &nbsp;<span class="var">t</span>)<br>
+            <br>
+            <span class="comment">This ensures the surface fills the viewport cleanly regardless of</span><br>
+            <span class="comment">whether the music browser is visible, the transport bar is showing,</span><br>
+            <span class="comment">or the full mic-mode view is active.</span>
+        </div>
+
+        <h3>Directional Lighting</h3>
+
+        <p>The surface uses a simple <strong>Lambertian diffuse</strong> lighting model — the brightness of each fragment depends on the angle between the surface normal and the light direction. This is the simplest physically-motivated lighting model: a surface facing the light is fully lit, a surface perpendicular to the light receives no direct illumination, and an ambient term prevents unlit faces from going completely black.</p>
+
+        <div class="math">
+            <span class="heading">Fragment shader lighting</span>
+            <span class="var">L</span> <span class="op">=</span> <span class="fn">normalize</span>(<span class="num">-0.5</span>, <span class="num">1.0</span>, <span class="num">0.3</span>) &nbsp;&nbsp;<span class="comment">light from above-left</span><br>
+            <span class="var">N</span> <span class="op">=</span> <span class="fn">normalize</span>(<span class="var">interpolatedNormal</span>) &nbsp;&nbsp;<span class="comment">per-fragment normal</span><br>
+            <span class="var">ambient</span> <span class="op">=</span> <span class="num">0.5</span><br>
+            <br>
+            <span class="var">NdotL</span> <span class="op">=</span> <span class="fn">max</span>(<span class="fn">dot</span>(<span class="var">N</span>, <span class="var">L</span>), &nbsp;<span class="num">0.0</span>)<br>
+            <span class="var">brightness</span> <span class="op">=</span> <span class="var">ambient</span> <span class="op">+</span> (<span class="num">1</span> <span class="op">-</span> <span class="var">ambient</span>) <span class="op">*</span> <span class="var">NdotL</span><br>
+            <br>
+            <span class="var">finalColor</span> <span class="op">=</span> <span class="var">vertexColor</span>.rgb <span class="op">*</span> <span class="var">brightness</span><br>
+            <br>
+            <span class="comment">With ambient = 0.5:</span><br>
+            <span class="comment">  Fully lit face (N parallel to L):   brightness = 0.5 + 0.5 * 1.0 = 1.0</span><br>
+            <span class="comment">  Unlit face (N perpendicular to L):  brightness = 0.5 + 0.5 * 0.0 = 0.5</span><br>
+            <span class="comment">  Half-lit face (45 degrees):         brightness = 0.5 + 0.5 * 0.707 = 0.854</span><br>
+            <br>
+            <span class="comment">The high ambient floor (0.5) ensures the back faces of the surface</span><br>
+            <span class="comment">remain visible. Lower ambient would add more dramatic contrast but</span><br>
+            <span class="comment">lose detail in the valleys.</span>
+        </div>
+
+        <h3>Surface Mesh Generation</h3>
+
+        <p>The surface mesh is a scrolling grid: frequency maps across the X axis and time flows along the Z axis. A <strong>circular buffer</strong> of 60 rows stores the spectrum history (~3 seconds at 20fps update rate). Each audio frame, the newest spectrum data is written into the current row and the write index advances. The mesh generator reads all 60 rows, wrapping around the buffer, to produce a continuous surface.</p>
+
+        <div class="math">
+            <span class="heading">Coordinate mapping</span>
+            <table>
+                <tr><th>Axis</th><th>Data</th><th>Range</th><th>Notes</th></tr>
+                <tr><td><span class="var">X</span></td><td>Frequency (band index)</td><td><span class="num">-1.0 .. +1.0</span></td><td>128 bands, logarithmic 20Hz-20kHz</td></tr>
+                <tr><td><span class="var">Y</span></td><td>Amplitude</td><td><span class="num">0 .. yScale</span></td><td>yScale: 0.6 (compact) to 1.2 (full view)</td></tr>
+                <tr><td><span class="var">Z</span></td><td>Time (row index)</td><td><span class="num">-1.0 .. +1.0</span></td><td>60 rows, oldest at back, newest at front</td></tr>
+            </table>
+            <br>
+            <span class="heading">Mesh topology</span>
+            <span class="comment">For each cell (row r, column c) in the 60 x 128 grid:</span><br>
+            <span class="comment">  Two triangles form a quad:</span><br>
+            <span class="comment">    Triangle 1: (r, c) → (r+1, c) → (r+1, c+1)</span><br>
+            <span class="comment">    Triangle 2: (r, c) → (r+1, c+1) → (r, c+1)</span><br>
+            <br>
+            <span class="var">quads</span> <span class="op">=</span> <span class="num">59</span> <span class="op">*</span> <span class="num">127</span> <span class="op">=</span> <span class="result">7,493</span><br>
+            <span class="var">triangles</span> <span class="op">=</span> <span class="num">7,493</span> <span class="op">*</span> <span class="num">2</span> <span class="op">=</span> <span class="result">14,986</span><br>
+            <span class="var">vertices</span> <span class="op">=</span> <span class="num">14,986</span> <span class="op">*</span> <span class="num">3</span> <span class="op">=</span> <span class="result">44,958</span><br>
+            <br>
+            <span class="heading">Face normal computation</span>
+            <span class="comment">For triangle (A, B, C):</span><br>
+            <span class="var">edge1</span> <span class="op">=</span> <span class="var">B</span> <span class="op">-</span> <span class="var">A</span><br>
+            <span class="var">edge2</span> <span class="op">=</span> <span class="var">C</span> <span class="op">-</span> <span class="var">A</span><br>
+            <span class="var">normal</span> <span class="op">=</span> <span class="fn">normalize</span>(<span class="var">edge1</span> <span class="op">×</span> <span class="var">edge2</span>) &nbsp;&nbsp;<span class="comment">cross product</span><br>
+            <br>
+            <span class="comment">Face normals (flat shading) are used rather than vertex normals</span><br>
+            <span class="comment">(smooth shading) — the faceted look suits the digital aesthetic</span><br>
+            <span class="comment">of the spectrum display.</span>
+        </div>
+
+        <p>The adaptive Y scale ensures the surface amplitude is visually proportional to the available view height. In compact mode (browser open, aspect ratio below 0.55), the scale is clamped to 0.6 to prevent the peaks from overflowing the viewport. In full view (mic mode, aspect ratio above 0.75), the scale extends to 1.2 for more dramatic peaks.</p>
+
+        <h3>Ridgeline Outlines (Surface+ Mode)</h3>
+
+        <p>Inspired by curve mode's bright top-edge outline, the surface+ mode adds thin ridgeline outlines traced along the top edge of each time row. These outlines give the mesh a wireframe-like definition that makes individual spectrum snapshots visually distinct as they scroll into the distance.</p>
+
+        <div class="math">
+            <span class="heading">Outline geometry</span>
+            <span class="comment">Each outline segment is a thin quad (0.008 world units thick) connecting</span><br>
+            <span class="comment">adjacent frequency bands along a single time row. The quads are offset</span><br>
+            <span class="comment">0.002 above the mesh surface to prevent z-fighting with the underlying</span><br>
+            <span class="comment">triangles. Colour is sampled from the same frequency gradient as the</span><br>
+            <span class="comment">mesh but boosted 1.3x for visibility against the lit surface.</span><br>
+            <br>
+            <span class="heading">Vertex budget</span>
+            <span class="comment">60 rows x 127 bands x 6 vertices per quad segment = ~46K vertices.</span><br>
+            <span class="comment">Combined with the ~45K surface mesh vertices, the total for surface+</span><br>
+            <span class="comment">mode is ~91K vertices — still well within the 200K budget.</span><br>
+            <br>
+            <span class="heading">Lighting</span>
+            <span class="comment">All outline quads use an upward-facing normal (0, 1, 0) so the</span><br>
+            <span class="comment">directional light brightens them consistently regardless of the</span><br>
+            <span class="comment">underlying mesh slope. This keeps the ridgelines legible even on</span><br>
+            <span class="comment">steep frequency transitions.</span>
+        </div>
+
+        <h3>Performance</h3>
+
+        <p>The 3D surface mode sits comfortably within the existing performance budget. The vertex count is well below the 2D modes, and the additional cost of depth testing and normal computation is negligible on modern Apple GPU architectures.</p>
+
+        <div class="math">
+            <span class="heading">Memory bandwidth comparison</span>
+            <table>
+                <tr><th>Pipeline</th><th>Max Vertices</th><th>Vertex Size</th><th>Bandwidth / Frame</th></tr>
+                <tr><td style="color:#00cc88">2D (bars, curve, etc.)</td><td><span class="num">~100,000</span></td><td><span class="num">32B</span></td><td><span class="num">~3.2 MB</span></td></tr>
+                <tr><td style="color:#cc88ff">3D (surface)</td><td><span class="num">~45,000</span></td><td><span class="num">48B</span></td><td><span class="num">~2.2 MB</span></td></tr>
+                <tr><td style="color:#cc88ff">3D (surface+)</td><td><span class="num">~91,000</span></td><td><span class="num">48B</span></td><td><span class="num">~4.4 MB</span></td></tr>
+            </table>
+            <br>
+            <span class="comment">The 3D mode uses less than half the GPU bandwidth of the 2D modes,</span><br>
+            <span class="comment">despite the larger per-vertex size. The depth buffer adds a single</span><br>
+            <span class="comment">float32 per pixel (~2.4 MB at the view resolution) — a fixed cost</span><br>
+            <span class="comment">regardless of mesh complexity.</span><br>
+            <br>
+            <span class="heading">Frame rate</span>
+            <span class="comment">Measured on iPhone 16 Pro: consistent 59-60 fps in surface mode,</span><br>
+            <span class="comment">matching the 2D modes. The GPU is not the bottleneck — at ~2.2 MB</span><br>
+            <span class="comment">per frame, the surface is well under the available memory bandwidth</span><br>
+            <span class="comment">of Apple's tile-based deferred rendering architecture.</span>
         </div>
     </div>
 </body>

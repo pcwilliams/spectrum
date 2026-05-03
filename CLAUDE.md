@@ -1,10 +1,9 @@
-# Apple Dev - Claude Code Project Conventions
 
-This folder contains native iOS apps built entirely through conversation with Claude Code. This file captures the shared principles, patterns, and preferences that apply across all projects.
+# iOS Development Conventions
+
+Native iOS apps built with Swift and SwiftUI. No storyboards, no external dependencies.
 
 ## Tech Stack
-
-Every project uses the same foundation:
 
 - **Language:** Swift 5
 - **UI Framework:** SwiftUI (no storyboards, no XIBs)
@@ -31,7 +30,7 @@ Each project follows this standard layout:
 ```
 ProjectName/
 ├── ProjectName.xcodeproj/
-├── CLAUDE.md                    # Developer reference (this kind of file)
+├── CLAUDE.md                    # Developer reference
 ├── README.md                    # User-facing documentation
 ├── architecture.html            # Interactive Mermaid.js architecture diagrams
 ├── tutorial.html                # Build narrative with prompts and responses
@@ -50,7 +49,7 @@ ProjectName/
         └── AccentColor.colorset/
 ```
 
-Smaller projects (e.g. Where) may flatten this into fewer files — the principle is simplicity over ceremony.
+Smaller projects (e.g. Where) may flatten this into fewer files — simplicity over ceremony.
 
 ## Xcode Project File (project.pbxproj)
 
@@ -88,20 +87,11 @@ xcodebuild -project ProjectName.xcodeproj -scheme ProjectName \
 - **Extract pure decision logic as `internal static` methods** with explicit parameters so tests can inject values directly — avoid testing through singletons, UserDefaults, or system frameworks
 - Test files that use Foundation types must `import Foundation` alongside `import Testing`
 
-### Philosophy: Maximise Simulator Coverage Before Device
-
-Device testing is expensive — each iteration requires a build, deploy, and manual interaction. The goal is to catch as many issues as possible in the simulator so that by the time the app runs on a real device, confidence is already high. This means:
-
-1. **Every testable mode and feature should be exercisable from the command line** via launch arguments
-2. **Bundled test files** (WAV, JSON, images) should exercise features that normally require live input (microphone, camera, network)
-3. **Diagnostic logging** should capture algorithmic decisions so issues can be diagnosed from log output, not just visual inspection
-4. **Screenshots are useful but logs are better** — a screenshot shows what happened, a log shows why
-
 ### Simulator Testing with Launch Arguments
 
 For apps with multiple modes or views, add **launch argument parsing** so visual testing can be fully automated from the command line — never try to tap simulator UI with AppleScript (it's unreliable). Parse `ProcessInfo.processInfo.arguments` in the root view to accept flags like `-mode <value>`.
 
-**Launch arguments must override persisted settings.** When an app uses `@AppStorage` or `UserDefaults` to remember UI state across launches, the persisted values load automatically. Launch arguments for testing must be applied *after* persistence loads (e.g. in `onAppear`) so they take priority. Without this, a test launch with `-mode bars` might be ignored because `@AppStorage` still holds `spectrogram` from the last manual session. Return optionals from launch-arg parsers (nil = no override) so they only replace the persisted value when explicitly provided.
+**Launch arguments must override persisted settings.** When an app uses `@AppStorage` or `UserDefaults`, launch arguments must be applied *after* persistence loads (e.g. in `onAppear`) so they take priority. Return optionals from launch-arg parsers (nil = no override).
 
 ```swift
 // In ContentView or root view
@@ -125,19 +115,17 @@ sleep 2
 xcrun simctl io booted screenshot /tmp/screenshot.png
 ```
 
-This pattern was established in ShiftingSands (which supports `-mode`, `-count`, `-test`, `-autostart`, etc.) and adopted in Spectrum (`-mode bars|curve|circular|spectrogram`). Every new project with multiple visual states should support this from the start.
+This pattern was established in ShiftingSands and adopted in Spectrum. Every new project with multiple visual states should support this from the start.
 
 ### Bundled Test Files for Hardware-Dependent Features
 
 When a feature depends on hardware input (microphone, GPS, camera), create **bundled test files** that exercise the same code path in the simulator:
 
-- **Audio**: Generate WAV files with Python that produce known inputs — pure tones (440Hz sine), multi-tone sequences (pitch changes every 1.5s), periodic beats (120 BPM kick drum). Bundle them in the app and play via `-testfile <name>` launch argument.
+- **Audio**: Generate WAV files with Python — pure tones (440Hz sine), multi-tone sequences, periodic beats. Bundle and play via `-testfile <name>` launch argument.
 - **Location**: Bundle JSON files with known GPS coordinates for map-based testing.
 - **Images**: Bundle sample photos with known EXIF data for photo-processing features.
 
-The key principle: **the DSP / processing pipeline shouldn't know or care whether input comes from hardware or a test file**. If the pipeline works correctly with a known test input in the simulator, it will work with real input on device (barring hardware-specific issues like sample rate differences).
-
-Example of generating a test audio file:
+The DSP/processing pipeline shouldn't know or care whether input comes from hardware or a test file.
 
 ```python
 import wave, struct, math
@@ -155,7 +143,7 @@ with wave.open('test.wav', 'w') as f:
 
 ### Diagnostic Logging for Algorithm Debugging
 
-For complex algorithms (DSP, ML, signal processing), add **structured diagnostic logging** that captures the algorithm's internal decisions — not just the final output. Gate verbose logging behind a launch argument so it's off in normal use but available when debugging.
+For complex algorithms (DSP, ML, signal processing), add **structured diagnostic logging** gated behind a launch argument:
 
 ```swift
 // In the engine/service
@@ -170,20 +158,11 @@ if Self.verboseLogging {
 if args.contains("-pitchlog") { AudioEngine.verboseLogging = true }
 ```
 
-This pattern proved essential in Spectrum's pitch detection: the algorithm was tuned iteratively by deploying to device, singing test tones, and sending the log output back for analysis. Without the per-frame diagnostic output, it would have been impossible to distinguish between "the autocorrelation found the wrong peak" and "the confidence threshold rejected a valid peak".
+**What to log:** algorithm confidence metrics, which branch/threshold was taken, input characteristics, state changes.
 
-**What to log:**
-- Algorithm confidence/quality metrics (e.g. autocorrelation peak strength, SNR)
-- Which branch/threshold was taken
-- Input characteristics (signal level, frequency content)
-- State changes (note changed, beat detected, silence entered)
+**What NOT to log every frame:** raw sample values, full array contents, unchanged state.
 
-**What NOT to log every frame** (too noisy):
-- Raw sample values
-- Full array contents
-- Unchanged state
-
-Use change-only logging for display state (only log when the displayed value changes) and periodic logging for diagnostics (every Nth frame).
+Use change-only logging for display state and periodic logging for diagnostics (every Nth frame).
 
 ### Reading Logs from Simulator and Device
 
@@ -195,29 +174,13 @@ cat "$CONTAINER/Documents/app.log"
 # Clear log before a test run
 > "$CONTAINER/Documents/app.log"
 
-# Device: build, install, launch, and retrieve logs automatically via CLI.
-# The device is "Paul's iPhone 16 Pro" (970899A3-153F-5EC2-834F-BAFFCDF2560B).
-# When connected, the full build-deploy-test cycle can run without Xcode GUI:
-
-# Build for device (code signing required — no CODE_SIGNING_ALLOWED=NO)
-xcodebuild -project ProjectName.xcodeproj -scheme ProjectName \
-  -destination "platform=iOS,name=Paul's iPhone 16 Pro" build
-
-# Install and launch with launch arguments
-xcrun devicectl device install app --device 970899A3-153F-5EC2-834F-BAFFCDF2560B \
-  path/to/ProjectName.app
-xcrun devicectl device process launch --device 970899A3-153F-5EC2-834F-BAFFCDF2560B \
-  com.pwilliams.ProjectName -- -mode bars -bpmlog
-
-# Copy log file from device container
-xcrun devicectl device copy from --device 970899A3-153F-5EC2-834F-BAFFCDF2560B \
-  --source Documents/app.log --domain-type appDataContainer \
-  --domain-identifier com.pwilliams.ProjectName --destination /tmp/app.log
+# Device: stream logs via:
+xcrun devicectl device syslog --device <udid>
 ```
 
 ### Performance Testing in the DSP/Rendering Pipeline
 
-For real-time processing (audio, video, rendering), measure execution time to verify the pipeline completes within its time budget:
+For real-time processing, measure execution time against the time budget:
 
 ```swift
 let start = CACurrentMediaTime()
@@ -234,7 +197,7 @@ if dspTimingCount % 100 == 0 {
 }
 ```
 
-The budget is the time between callbacks (e.g. 2048 samples at 44.1kHz = 46.4ms). If average processing exceeds ~50% of the budget, optimise before adding features. If max processing occasionally exceeds the budget, investigate the spike.
+Budget = time between callbacks (e.g. 2048 samples at 44.1kHz = 46.4ms). If average exceeds ~50% of budget, optimise before adding features.
 
 ### Simulator vs Device Differences
 
@@ -244,10 +207,8 @@ The simulator does NOT replicate everything. Always test on device for:
 - **GPS / CoreLocation** (simulator uses simulated locations)
 - **Audio session behaviour** (`.playAndRecord` fails on simulator — use `.playback` with `#if targetEnvironment(simulator)`)
 - **Sample rates** (simulator often uses 44.1kHz, device may use 48kHz — parameterise, don't hardcode)
-- **Real-world signal characteristics** (voice has harmonics, vibrato, breath noise that pure test tones lack — algorithms that work on sine waves may fail on voice)
+- **Real-world signal characteristics** (voice has harmonics, vibrato, breath noise that pure test tones lack)
 - **Hardware format edge cases** (0 Hz sample rate, 0 input channels — detect and alert the user)
-
-The ideal workflow: build and iterate in the simulator until unit tests pass and test files produce correct output, then deploy to device for final validation with real-world input.
 
 ## Key Patterns
 
@@ -289,6 +250,16 @@ The ideal workflow: build and iterate in the simulator until unit tests pass and
 - **@AppStorage** for persisting UI preferences across launches
 - **`.contentShape(Rectangle())`** for full-row tap targets
 
+### GPU rendering — 3D surfaces, terrain, waterfalls, landscapes
+
+For any feature that renders a 2D value field as a lit, animated 3D surface (frequency × time, day × hour, X × Y × any-Z, ridgelines, terrain), use the **`3dsurface`** skill. It captures the canonical Metal pipeline, mesh, camera math, lighting, smoothing, and animation patterns extracted from HeartMap and Spectrum — including the non-obvious decisions (fixed colour scales, smoothing-decoupled-from-colour, face normals, locked camera) that make a surface read as *stunning* rather than just correct.
+
+### Apple Health / HealthKit
+
+For any feature that reads heart rate, steps, workouts, sleep, or other Apple Health data, use the **`healthkit`** skill. It captures the actor-based service shape, authorization (single combined prompt; read perms aren't queryable), the optimized fetch patterns (per-month queries, server-side bucketing via `HKStatisticsCollectionQuery + .cumulativeSum`, parallel `async let`), the three-phase load (disk-cache seed → current-month refresh → background stream), the empty-result fallback to demo data, infinity-safe JSON disk caching, workout activity type → label/symbol mapping, and entitlements/provisioning gotchas (wildcard profiles can't carry HealthKit).
+
+For *clinical interpretation* of that data — fitness scores, resting heart rate calculations, AHA active-minute zones, age-adjusted scoring, evidence-based step thresholds — use the **`health`** skill. It's platform-agnostic (useful in web dashboards too) and always carries an explicit "not medical advice" disclaimer.
+
 ## App Icons
 
 Generated programmatically using **Python/Pillow** — not designed in a graphics tool. Three variants at 1024x1024:
@@ -301,52 +272,33 @@ Referenced in `Contents.json` with `luminosity` appearance variants. Use `Image.
 
 ## Documentation
 
-Each project includes four living documents that must be kept up to date as the project evolves:
+Each project includes four living documents that must be kept up to date:
 
 ### CLAUDE.md (developer reference)
 
-The comprehensive knowledge base for Claude Code sessions. Must be updated whenever:
-- A new file, model, view, or service is added or removed
-- An architectural decision is made or changed
-- A new API is integrated or an existing one changes
-- A non-obvious bug is fixed or a gotcha is discovered
-- Build configuration, test coverage, or project structure changes
+Must be updated whenever: a file, model, view, or service is added/removed; an architectural decision is made; a new API is integrated; a non-obvious bug is fixed; build configuration or project structure changes.
 
 This is the single source of truth for project context. A future session should be able to read CLAUDE.md and understand the entire project without exploring the codebase.
 
 ### README.md (user-facing)
 
-The public-facing project overview. Must be updated whenever:
-- Features are added, changed, or removed
-- Setup instructions change (new dependencies, API keys, permissions)
-- The project structure changes significantly
-- Screenshots become outdated (note when a new screenshot is needed)
-
-Keep it concise and practical — someone should be able to clone the repo and get running by following the README.
+Must be updated whenever: features are added/changed/removed; setup instructions change; project structure changes significantly; screenshots become outdated.
 
 ### architecture.html (architecture diagrams)
 
-Interactive Mermaid.js diagrams rendered in a standalone HTML file. Must be updated whenever:
-- The view hierarchy changes (new views, removed views, restructured navigation)
-- Data flow changes (new services, new API integrations, changed data pipelines)
-- New major subsystems are added (e.g. a notification system, a caching layer, a P&L calculator)
+Interactive Mermaid.js diagrams. Must be updated whenever: view hierarchy changes; data flow changes; new major subsystems are added.
 
-Use `graph TD` (top-down) for readability on narrow screens. Load Mermaid.js from CDN. Apply the shared dark theme with CSS custom properties and project-appropriate accent colours.
+Use `graph TD` for readability. Load Mermaid.js from CDN. Apply the shared dark theme with CSS custom properties and project-appropriate accent colours.
 
 ### tutorial.html (build narrative)
 
-A step-by-step record of how the app was built through Claude Code conversation. Must be updated whenever:
-- A significant new feature is added via a notable prompt interaction
-- A major refactor or architectural change is made
-- An interesting problem is solved through iterative prompting
+A step-by-step record of how the app was built. Must be updated whenever: a significant new feature is added; a major refactor is made; an interesting problem is solved through iterative prompting.
 
-Capture the essence of the prompt, the approach taken, and the outcome. This documents the collaborative development process and serves as a guide for building similar features in future projects.
-
-**Prompt tone:** Prompts recorded in the tutorial should sound collaborative, not demanding. Use phrases like "Could we try...", "How about...", "Would you mind...", "Would it be worth...", "I'd love it if..." rather than "Make...", "Add...", "I want...", "I need...". When describing problems, use "I'm seeing..." or "I'm noticing..." rather than assertive declarations. The tone should reflect a partnership — two people working together on something, not instructions being issued.
+**Prompt tone:** Use collaborative language — "Could we try...", "How about...", "I'd love it if..." rather than imperatives. Use "I'm seeing..." for problems rather than assertive declarations.
 
 ### Formatting conventions
 
-- Use plain Markdown in `.md` files (no inline HTML except README badges). Images must use `![alt](src)` syntax, not `<img>` tags
+- Plain Markdown in `.md` files (no inline HTML except README badges). Images use `![alt](src)` syntax, not `<img>` tags
 - HTML docs use a shared dark theme with CSS custom properties and Mermaid.js loaded from CDN
 - HTML docs include a hero screenshot in a phone-frame wrapper (black background, rounded corners, drop shadow) below the title/badges
 
@@ -359,13 +311,448 @@ Capture the essence of the prompt, the approach taken, and the outcome. This doc
 
 ---
 
+
+# 3D Surface Rendering — Battle-Tested Patterns
+
+Both HeartMap (`heart-rate × day × hour`) and Spectrum (`amplitude × frequency × time`) independently converged on essentially the same 3D-surface pipeline. This skill captures that pipeline as a reusable starting point — the shader pair, vertex layout, camera math, mesh construction, animation discipline, and the small handful of decisions that make a surface *stunning* rather than merely correct.
+
+The two reference implementations live in:
+
+- `~/appledev/heartmap/HeartMap/Rendering/{HeartMapRenderer.swift,Shaders.metal}`
+- `~/appledev/spectrum/Spectrum/Rendering/{MetalRenderer.swift,Shaders.metal}`
+
+Read those if any pattern below is unclear — they're the ground truth.
+
+## When to use
+
+A 3D surface is the right tool when you have a 2D grid of values that varies in two independent dimensions (time × something, day × hour, X × Y) and you want the user to *feel* the shape of the data — peaks, valleys, ridges, isolated spikes. It is not the right tool for sparse data, categorical data, or anything that would read better as a chart, table, or flat heatmap.
+
+## The shader pair (canonical)
+
+Both projects use identical Metal shaders for the surface pipeline. Use this verbatim — it is the settled answer:
+
+```metal
+#include <metal_stdlib>
+using namespace metal;
+
+// Must match Swift's SurfaceVertex layout exactly:
+// SIMD3<Float> + SIMD3<Float> + SIMD4<Float> = 48 bytes stride.
+struct SurfaceVertexIn {
+    float3 position;
+    float3 normal;
+    float4 color;
+};
+
+// Must match Swift's SurfaceUniforms layout:
+// float4x4 (64) + float4 (16) = 80 bytes.
+struct SurfaceUniforms {
+    float4x4 mvpMatrix;
+    float4 lightDirectionAndAmbient;  // xyz = light dir, w = ambient
+};
+
+struct SurfaceVertexOut {
+    float4 position [[position]];
+    float4 color;
+    float3 normal;
+};
+
+vertex SurfaceVertexOut surface_vertex(
+    const device SurfaceVertexIn* vertices [[buffer(0)]],
+    constant SurfaceUniforms& uniforms [[buffer(1)]],
+    uint vid [[vertex_id]])
+{
+    SurfaceVertexOut out;
+    out.position = uniforms.mvpMatrix * float4(vertices[vid].position, 1.0);
+    out.color = vertices[vid].color;
+    out.normal = vertices[vid].normal;
+    return out;
+}
+
+fragment float4 surface_fragment(
+    SurfaceVertexOut in [[stage_in]],
+    constant SurfaceUniforms& uniforms [[buffer(1)]])
+{
+    float3 N = normalize(in.normal);
+    float3 L = uniforms.lightDirectionAndAmbient.xyz;
+    float ambient = uniforms.lightDirectionAndAmbient.w;
+    float NdotL = max(dot(N, L), 0.0);
+    float lighting = ambient + (1.0 - ambient) * NdotL;
+    return float4(in.color.rgb * lighting, in.color.a);
+}
+```
+
+The CPU does all the interesting work — building vertices, computing normals, picking colours, animating heights. The shader is intentionally minimal: transform, light, draw.
+
+## Swift mirror structs (exact byte layout)
+
+```swift
+import simd
+
+/// Must match Metal's SurfaceVertexIn (48 bytes: 3·float3-aligned-as-float4 + float4).
+struct SurfaceVertex {
+    var position: SIMD3<Float>
+    var normal: SIMD3<Float>
+    var color: SIMD4<Float>
+}
+
+/// Must match Metal's SurfaceUniforms (80 bytes).
+struct SurfaceUniforms {
+    var mvpMatrix: simd_float4x4
+    var lightDirectionAndAmbient: SIMD4<Float>  // xyz = normalised dir, w = ambient
+}
+```
+
+**Alignment rule (the bug everyone hits once):** Use **non-packed** `float3`/`float4` in Metal so the strides match Swift's `SIMD3<Float>` (16-byte aligned) and `SIMD4<Float>` (16-byte aligned). `packed_float3`/`packed_float4` give 4-byte alignment and a different stride — which produces silently garbled rendering, not a crash. If the surface looks scrambled, this is the first thing to check.
+
+## Pipeline & MTKView setup
+
+```swift
+mtkView.device = device
+mtkView.clearColor = MTLClearColor(red: 0.04, green: 0.04, blue: 0.08, alpha: 1.0)
+mtkView.preferredFramesPerSecond = 60
+mtkView.depthStencilPixelFormat = .depth32Float
+mtkView.colorPixelFormat = .bgra8Unorm
+
+let desc = MTLRenderPipelineDescriptor()
+desc.vertexFunction = library.makeFunction(name: "surface_vertex")
+desc.fragmentFunction = library.makeFunction(name: "surface_fragment")
+desc.colorAttachments[0].pixelFormat = mtkView.colorPixelFormat
+desc.colorAttachments[0].isBlendingEnabled = true
+desc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+desc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+desc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+desc.depthAttachmentPixelFormat = .depth32Float
+
+let depthDesc = MTLDepthStencilDescriptor()
+depthDesc.depthCompareFunction = .less
+depthDesc.isDepthWriteEnabled = true
+let depthStencilState = device.makeDepthStencilState(descriptor: depthDesc)!
+```
+
+When encoding the draw call:
+
+```swift
+encoder.setRenderPipelineState(pipelineState)
+encoder.setDepthStencilState(depthStencilState)
+encoder.setFrontFacing(.counterClockwise)
+encoder.setCullMode(.none)              // surfaces are viewed from above; back faces visible at edges
+encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+encoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
+encoder.setFragmentBuffer(uniformBuffer, offset: 0, index: 1)
+encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count)
+```
+
+**`.cullMode(.none)`** is deliberate: the camera looks down at ~30° elevation, so the underside of folded ridges occasionally faces forward. Culling them gives ugly black flickers at peaks. The performance hit at these triangle counts is invisible.
+
+**Depth format on every pipeline.** If your project has more than one pipeline (e.g. a 2D pass plus this 3D one), every pipeline descriptor must declare `depthAttachmentPixelFormat = .depth32Float` to match the MTKView, even if the 2D pipeline doesn't use depth testing. Mismatch is a crash on first draw.
+
+## Camera math (proj * view, no model)
+
+The reference apps use a standard right-handed look-at + perspective matrix and pre-multiply on the CPU each frame:
+
+```swift
+private func buildMVPMatrix() -> simd_float4x4 {
+    let azRad = azimuth * .pi / 180.0
+    let elRad = elevation * .pi / 180.0
+    let camX = distance * cos(elRad) * sin(azRad)
+    let camY = distance * sin(elRad)
+    let camZ = distance * cos(elRad) * cos(azRad)
+    let eye = SIMD3<Float>(camX, camY, camZ)
+    let target = SIMD3<Float>(0, heightScale * 0.35, 0)  // look slightly above the floor
+    let up = SIMD3<Float>(0, 1, 0)
+    let view = lookAtMatrix(eye: eye, target: target, up: up)
+    let proj = perspectiveMatrix(fovY: 50.0 * .pi / 180.0,
+                                  aspect: max(0.2, aspectRatio),
+                                  near: 0.1, far: 100.0)
+    return proj * view
+}
+
+private func lookAtMatrix(eye: SIMD3<Float>, target: SIMD3<Float>, up: SIMD3<Float>) -> simd_float4x4 {
+    let f = simd_normalize(target - eye)
+    let s = simd_normalize(simd_cross(f, up))
+    let u = simd_cross(s, f)
+    var m = matrix_identity_float4x4
+    m[0][0] = s.x; m[1][0] = s.y; m[2][0] = s.z
+    m[0][1] = u.x; m[1][1] = u.y; m[2][1] = u.z
+    m[0][2] = -f.x; m[1][2] = -f.y; m[2][2] = -f.z
+    m[3][0] = -simd_dot(s, eye)
+    m[3][1] = -simd_dot(u, eye)
+    m[3][2] = simd_dot(f, eye)
+    return m
+}
+
+private func perspectiveMatrix(fovY: Float, aspect: Float, near: Float, far: Float) -> simd_float4x4 {
+    let y = 1.0 / tan(fovY / 2.0)
+    let x = y / aspect
+    let z = far / (near - far)
+    var m = simd_float4x4(0)
+    m[0][0] = x
+    m[1][1] = y
+    m[2][2] = z
+    m[2][3] = -1.0
+    m[3][2] = z * near
+    return m
+}
+```
+
+### Default camera framing
+
+| Parameter | Value | Why |
+|-----------|-------|-----|
+| Azimuth | **40°** | Three-quarters view — both grid axes legible, ridges read as ridges. Pure 0° or 90° loses depth cues. |
+| Elevation | **30°** (HeartMap) / **34°** (Spectrum) | Low enough to feel the topology; high enough to see all rows without back rows occluding front rows. |
+| Distance | **5.2** (HeartMap) / **6.5** (Spectrum) | Tuned per-app so peaks at the corners don't clip the viewport. Push back if you see clipping. |
+| FOV (Y) | **50°** | Slightly wider than the classic 45° — gives breathing room around the corners on phone aspect ratios. |
+| Target Y | `heightScale * 0.35` | Look slightly above the floor so the surface centres in the frame, not the base plane. |
+
+### Aspect-adaptive camera (Spectrum's twist)
+
+When the surrounding UI animates in/out (a music browser, a slide-up panel) the Metal view's aspect ratio changes mid-animation. A hard threshold causes a jarring camera jump. The fix is to interpolate between two preset camera positions across an aspect-ratio range:
+
+```swift
+let t = max(0, min(1, (aspectRatio - 0.55) / (0.75 - 0.55)))
+let azimuth = azNormal + t * (azCompact - azNormal)
+let elevation = elNormal + t * (elCompact - elNormal)
+let distance = dNormal + t * (dCompact - dNormal)
+```
+
+Use this *only* when the view actually resizes during the session. For a fixed-layout surface, lock the camera and lock it hard.
+
+### Camera locked vs. orbit
+
+Both apps eventually disabled their camera orbit. A slow ambient orbit looks beautiful in isolation but breaks any SwiftUI overlay that needs to project through the same MVP (axis labels, peak connectors, hover targets). A locked camera lets the SwiftUI side compute screen positions from a stable matrix once per layout pass instead of once per frame. **Default to locked.** If you want movement, animate the data, not the camera.
+
+## Building the mesh
+
+The unit cube is `[-1.05, 1.05]` on X and Z, `[0, heightScale]` on Y. The 1.05 (instead of 1.0) is so axis lines and tick marks at the edges aren't lost to the camera frustum. `heightScale = 1.1` lifts peaks slightly above the cube top so workout/loud-note ridges have presence against perspective foreshortening.
+
+Two triangles per cell, **face normals** (not vertex normals — the surfaces are intentionally faceted; vertex normals smooth out the geometric story you're trying to tell):
+
+```swift
+for d in 0..<(rows - 1) {
+    let z0 = zFor(d), z1 = zFor(d + 1)
+    for b in 0..<(cols - 1) {
+        let x0 = xFor(b), x1 = xFor(b + 1)
+
+        let p00 = SIMD3<Float>(x0, h00 * heightScale, z0)
+        let p01 = SIMD3<Float>(x1, h01 * heightScale, z0)
+        let p10 = SIMD3<Float>(x0, h10 * heightScale, z1)
+        let p11 = SIMD3<Float>(x1, h11 * heightScale, z1)
+
+        // Face normal — same for both triangles of the cell so the lighting
+        // is per-quad, not per-triangle. Reads as a faceted surface, not a
+        // jagged one.
+        let edge1 = p01 - p00
+        let edge2 = p10 - p00
+        var normal = simd_cross(edge2, edge1)
+        let len = simd_length(normal)
+        if len > 0 { normal /= len } else { normal = SIMD3<Float>(0, 1, 0) }
+
+        // Triangle 1 + Triangle 2 sharing the (p01, p10) edge.
+        vertices.append(SurfaceVertex(position: p00, normal: normal, color: c00))
+        vertices.append(SurfaceVertex(position: p01, normal: normal, color: c01))
+        vertices.append(SurfaceVertex(position: p10, normal: normal, color: c10))
+        vertices.append(SurfaceVertex(position: p01, normal: normal, color: c01))
+        vertices.append(SurfaceVertex(position: p11, normal: normal, color: c11))
+        vertices.append(SurfaceVertex(position: p10, normal: normal, color: c10))
+    }
+}
+```
+
+**Cross-product order matters.** HeartMap uses `simd_cross(edge2, edge1)`; Spectrum uses `simd_cross(edge1, edge2)`. They produce opposite normals — and combined with each app's light direction, they happen to look right. If your surface comes out lit *darker* on top than underneath, swap the cross-product order.
+
+## Animation: target vs. display fields
+
+A surface that snaps to new data looks cheap. A surface that smoothly morphs feels alive. The pattern in both apps:
+
+```swift
+private var targetHeights: [[Float]] = []      // what we want to be
+private var displayHeights: [[Float]] = []     // what we are right now
+private var morphLerp: Float = 0.09            // ~330 ms half-life
+
+// In draw():
+for d in 0..<displayHeights.count {
+    for b in 0..<displayHeights[d].count {
+        let cur = displayHeights[d][b]
+        let tgt = targetHeights[d][b]
+        displayHeights[d][b] = cur + (tgt - cur) * morphLerp
+    }
+}
+```
+
+When new data arrives, set `targetHeights` only. Each frame interpolates one step. With `lerp = 0.09` at 60fps, ~330ms half-life — slow enough for the eye to track, fast enough not to feel sluggish.
+
+For data sets where dimensions can change (different month lengths, different history depths), **pad to a fixed maximum** so the per-cell lerp always has matching slots. HeartMap pads every month to 31 day-rows; missing days have their data mask cleared but the slot exists.
+
+### Decoupling colour from smoothed height
+
+The single most important "stunning" trick from HeartMap. If you smooth the height field for visual flow *and* derive colour from the same smoothed field, brief peaks lose their colour:
+
+```
+A 150 bpm spike flanked by 60 bpm rest, after a [1,2,1]/4 blur,
+becomes ~0.28 height — which maps to cyan-green on a fixed scale.
+But 150 bpm should be red-orange.
+```
+
+Fix: keep two parallel fields. `displayHeights` is smoothed and drives mesh Y. `displayColorHeights` is **raw pre-smooth** and drives vertex colour. Both lerp toward their targets in lock-step so transitions stay coherent. Result: the geometry flows gently, but a 150 bpm bucket renders unmistakably 150-bpm-coloured.
+
+This is a pattern, not a bug. Use it whenever colour carries meaning that smoothing would dilute.
+
+## Smoothing — separable [1,2,1]/4, mask-aware
+
+A two-pass separable blur is the right amount of smoothing — enough to flow, not so much that signal is lost. Two passes (horizontal then vertical) of `[1,2,1]/4` is equivalent to a 3×3 Gaussian-ish kernel for a fraction of the multiplies.
+
+The non-obvious requirement: **mask-aware**. Empty cells must stay at the floor and must not pull populated neighbours down. The data/no-data boundary should remain crisp, not feathered:
+
+```swift
+static func smooth(heights: [[Float]], mask: [[Bool]]) -> [[Float]] {
+    let rows = heights.count, cols = heights[0].count
+    var pass1 = heights
+    for d in 0..<rows {
+        for b in 1..<(cols - 1) where mask[d][b] {
+            let center = heights[d][b]
+            let l = mask[d][b - 1] ? heights[d][b - 1] : center
+            let r = mask[d][b + 1] ? heights[d][b + 1] : center
+            pass1[d][b] = (l + 2 * center + r) * 0.25
+        }
+    }
+    var pass2 = pass1
+    for d in 1..<(rows - 1) {
+        for b in 0..<cols where mask[d][b] {
+            let center = pass1[d][b]
+            let up = mask[d - 1][b] ? pass1[d - 1][b] : center
+            let dn = mask[d + 1][b] ? pass1[d + 1][b] : center
+            pass2[d][b] = (up + 2 * center + dn) * 0.25
+        }
+    }
+    return pass2
+}
+```
+
+When a neighbour is empty, fall back to the centre value rather than zero — that's what keeps the boundary crisp instead of producing a gentle slope down to nothing.
+
+## Colour and lighting choices
+
+### Lighting
+
+Directional N·L plus an ambient floor — that's the entire fragment shader. Tunable parameters:
+
+| Parameter | HeartMap | Spectrum | Why |
+|-----------|----------|----------|-----|
+| Light direction | `normalize(-0.4, 1.0, 0.35)` | `normalize(-0.5, 1.0, 0.3)` | Above-left, slightly forward. Casts visible shadow on the right of every ridge — reads as depth. |
+| Ambient | **0.55** (HeartMap) / **0.5** (Spectrum) | — | High ambient floor (≥0.5) keeps shadowed faces visible. Below 0.4 and dark valleys become unreadable. |
+
+Both apps use **face normals**, not vertex normals — see the mesh-building section. Vertex normals smooth out the very ridges you're trying to celebrate.
+
+### Colour ramps
+
+Two valid strategies, pick based on what your data means:
+
+**1. Position-based (Spectrum's curve/surface modes).** Colour reflects *where* on the X axis the vertex is — frequency band → blue→cyan→green→yellow→red. Five-stop linear ramp over `t ∈ [0, 1]`. Good when X has its own meaning the user should track (which frequency? which day?).
+
+**2. Height-based with a fixed scale (HeartMap).** Colour reflects *what* the value is, anchored to a domain-meaningful scale (40–190 bpm, 0–4000 steps). Critically: **don't auto-scale per frame**. A 170 bpm peak in January should look the same shade of red as a 170 bpm peak in May. Auto-scaled colour ramps lie — they make every dataset look equally dramatic. A fixed scale makes the slider a real comparison tool.
+
+### The "no-data floor" pattern
+
+If your grid can have empty cells, give them a **distinct colour** — not just "low value". HeartMap uses deep navy `SIMD4(0.04, 0.06, 0.18, 1)`, visually separate from the active gradient's resting blue. Combined with mask-aware smoothing keeping the boundary crisp, the result reads as "no reading" rather than "low reading", which matters for medical/meaningful data.
+
+### Ridgelines (Spectrum's `surfaceLines` mode)
+
+A wireframe-over-solid look that makes individual time slices easier to track. Draw a second set of thin quads along the top edge of each row, offset slightly above the surface (`+0.002` Y), with **1.3× colour boost** so they pop against the lit surface beneath:
+
+```swift
+let bc = Self.gradientColor(at: t) * SIMD4(1.3, 1.3, 1.3, 1.0)
+// Then draw thin quads at (x, surfaceY + 0.002, z) along each row.
+```
+
+The `1.3×` deliberately exceeds 1.0, clamping bright at the GPU. Reads as "lit edges" without needing a separate emissive shader.
+
+## Performance discipline
+
+The whole point of GPU rendering is staying off the main thread's critical path. The two reference apps sustain 60fps with these rules:
+
+- **Pre-allocate one large MTLBuffer at init** sized for the worst case (HeartMap: 200K vertices × 48 bytes ≈ 9.6 MB; Spectrum surface: 70K vertices). Never allocate buffers per-frame.
+- **One draw call per frame.** Build all geometry — surface mesh, ridgelines, axis lines, tick marks — into the same buffer and issue one `drawPrimitives`. Multiple draw calls are not free at this scale.
+- **Reserve vertex array capacity once.** `vertices.reserveCapacity((rows-1) * (cols-1) * 6 + 64)` — the `+ 64` covers axis decorations.
+- **Don't `@Published` data the renderer reads at 60fps.** SwiftUI re-renders the entire view tree on every `@Published` change. The renderer should hold a `weak` reference to its data source and read directly. UI labels that need the same data can refresh from a 0.5s timer.
+- **Per-cell work is the budget.** A 31×48 grid is 1488 cells × 6 vertices × 48 bytes = 428 KB to upload per frame. Trivial. A 128×128 grid is 6.3 MB — still fine. Past that, switch to instanced rendering or a vertex shader that reads heights from a texture.
+
+## SwiftUI integration
+
+Wrap the `MTKView` in a `UIViewRepresentable`. Don't try to layer SwiftUI views *inside* the Metal view — instead, overlay them on top and project through the renderer's MVP:
+
+```swift
+// In the renderer, expose a project() helper:
+func project(_ point: SIMD3<Float>, viewSize: CGSize) -> CGPoint? {
+    let mvp = buildMVPMatrix()
+    let clip = mvp * SIMD4<Float>(point.x, point.y, point.z, 1)
+    guard clip.w > 0.0001 else { return nil }
+    let ndcX = clip.x / clip.w, ndcY = clip.y / clip.w
+    let x = (CGFloat(ndcX) * 0.5 + 0.5) * viewSize.width
+    let y = (1.0 - (CGFloat(ndcY) * 0.5 + 0.5)) * viewSize.height
+    return CGPoint(x: x, y: y)
+}
+
+// Also expose a height-readback for spline endpoints landing on the surface:
+func surfaceYAt(day d: Int, bucket b: Int) -> Float? { ... }
+func surfaceTargetYAt(day d: Int, bucket b: Int) -> Float? { ... }  // FINAL value, not lerping
+```
+
+Now SwiftUI can place axis labels, tooltips, peak markers, or animated spline connectors at exact 3D points. **Spline tips that need to land on a peak across animations should read `surfaceTargetYAt` (the final value), not `surfaceYAt` (the currently-lerping value)** — otherwise mode/data changes leave the spline tip stuck near the floor while the mesh catches up.
+
+Animated geometry on top of the surface — like HeartMap's peak connectors — works well as custom SwiftUI `Shape`s with `animatableData = AnimatablePair<Double, Double>(day, hour)`. SwiftUI interpolates the fractional cell coordinates; each intermediate `path(in:)` bilinearly samples the height field. The result is a marker that glides smoothly across the mesh instead of teleporting.
+
+## Common gotchas
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Garbled/scrambled rendering on first run | Vertex struct stride mismatch | Use non-packed `float3`/`float4` in Metal so stride matches Swift's SIMD alignment |
+| Crash on first draw with depth error | Pipeline missing `depthAttachmentPixelFormat` | Set `.depth32Float` on **every** pipeline descriptor that shares the MTKView |
+| Bright peaks render as wrong colour | Smoothing-then-colouring | Decouple: smoothed field for geometry, raw field for colour |
+| Hard pop on month/mode change | No interpolation | `targetHeights` + `displayHeights` + per-frame lerp at ~0.09 |
+| Spline overlay teleports across mesh | Reading `displayHeights` mid-morph | Read `targetHeights` for final-position queries |
+| 30fps instead of 60fps when data updates | `@Published` triggering view-tree rebuild | Renderer holds `weak` data ref, reads directly; refresh non-render UI from timer |
+| Camera jumps when surrounding UI animates | Hard threshold on aspect ratio | Interpolate camera params across an aspect range |
+| Black flickers at peak edges | `.cullMode(.back)` killing forward-facing back faces | Use `.cullMode(.none)` |
+| SwiftUI overlay labels jitter | Camera orbiting | Lock camera; project once per layout, not per frame |
+| Surface lit darker on top than underneath | Cross-product order vs. light direction | Swap `cross(edge1, edge2)` ↔ `cross(edge2, edge1)` |
+| Data/no-data boundary feathers into fog | Naive smoothing crosses the mask | Mask-aware blur — empty neighbours fall back to centre value |
+| Test for an unusual peak shape only fails on device | Simulator vs device aspect ratios differ | Always test camera framing on a real device, not just the simulator |
+
+## Stunning vs. just-working — the small handful of decisions that mattered
+
+If a future surface is going to feel *compelling*, not just functional, these are the calls that made the difference in the reference apps:
+
+1. **Fixed colour scales, not auto-scaled.** A 170 BPM peak today should look identical to a 170 BPM peak six months ago. Auto-scale lies.
+2. **Decouple smoothing from colour.** Smooth the geometry; colour the raw value. Brief peaks keep their identity.
+3. **Distinct "no-data" colour.** Don't conflate "no reading" with "low reading" — give it its own deep, calm shade.
+4. **Mask-aware smoothing.** Crisp data/no-data edges read as honest. Feathered edges read as wrong.
+5. **Face normals, not vertex normals.** The faceting is the visual story.
+6. **Lock the camera by default.** Surface drama comes from the data, not camera moves. Locked cameras let SwiftUI overlays project cleanly.
+7. **High ambient floor (≥0.5).** Shadowed faces must remain visible — undertows of dark unreadable geometry kill the look.
+8. **Subtle axis lines + tick marks at the front edge.** Architectural ground-plan aesthetic, not a 3D chart with full wire cube.
+9. **Animate transitions, never snap.** ~300ms half-life on `displayHeights → targetHeights` lerp — slow enough to track, fast enough to feel responsive.
+10. **One draw call per frame, one MTLBuffer pre-allocated.** Stay 60fps rock-solid; everything else compounds from there.
+
+## Reference implementations
+
+Both apps run on iPhone, both deploy via `xcodebuild`, both have unit-tested smoothing/colour logic. When in doubt:
+
+- **HeartMap** (`~/appledev/heartmap/`) — the height-as-meaning case, with mode crossfade, fixed colour scale, and SwiftUI peak-connector overlays projecting through the renderer's MVP.
+- **Spectrum** (`~/appledev/spectrum/`) — the time-streaming case, with circular-buffer history, aspect-adaptive camera, and an optional bright-ridgeline pass.
+
+The accompanying `tutorial.html` files in each project describe the conversational journey that produced these patterns — read those for the *why* behind a non-obvious decision before changing it.
+
+---
+
 # Spectrum - Claude Code Developer Reference
 
 ## Overview
 
 Real-time audio spectrum analyser for iPhone. Captures microphone input or plays local music files, performs FFT analysis using Apple's Accelerate framework (vDSP), and renders six GPU-accelerated visualisation modes via Metal at 60fps with silky-smooth animation, plus a 3D surface waterfall mode with Metal depth buffer and directional lighting. Includes fundamental frequency detection (tuning overlay with note name and cents offset) and BPM detection with beat flash visualisation.
 
-For shared conventions (tech stack, architecture patterns, testing strategy, simulator workflow, diagnostic logging, and common gotchas), see the [parent CLAUDE.md](../CLAUDE.md).
+Shared iOS conventions (tech stack, MVVM architecture, simulator launch-arg testing, diagnostic logging) and the canonical Metal 3D-surface pipeline live in the `ios` and `3dsurface` skills referenced above.
 
 ## Architecture
 
@@ -647,6 +1034,23 @@ Device testing is required for:
 - Playing actual purchased/imported tracks
 - Mic-based tuning (guitar, voice)
 - BPM detection with real music
+
+The bundled `run_phone.sh` does the build → install → launch flow in one
+step, with proper code-signing (it reads `APPLE_TEAM_ID` / `IPHONE_UDID` /
+`IPHONE_BUILD_ID` from `~/appledev/setupenv.sh`). Trailing arguments are
+forwarded to the app's launch-arg parser:
+
+```bash
+./run_phone.sh                                         # plain launch
+./run_phone.sh -mode surface+ -source music            # specific mode/source
+./run_phone.sh -autoplay "Missing" -bpm                # play track + BPM overlay
+./run_phone.sh -tuning -pitchlog                       # tuner with verbose log
+```
+
+If you need to invoke `xcodebuild` manually, use the `id=$IPHONE_BUILD_ID`
++ `-allowProvisioningUpdates` + `DEVELOPMENT_TEAM=$APPLE_TEAM_ID` form —
+the bare `name="Paul's iPhone…"` destination silently produces an
+*unsigned* `.app` that fails to install with `No code signature found`.
 
 ### Approach to Debugging Audio Issues
 

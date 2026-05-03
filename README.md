@@ -52,6 +52,19 @@ Captures live microphone audio or plays music from your library, performs Fast F
 4. Grant microphone permission when prompted
 5. For music mode, grant Media & Apple Music permission
 
+For day-to-day rebuilds, use the bundled helper — it builds (signed),
+installs, and launches in one step, forwarding any extra args to the
+app's launch arguments:
+
+```bash
+./run_phone.sh                                  # plain launch
+./run_phone.sh -mode surface+ -source music     # pick mode/source
+./run_phone.sh -autoplay "Missing" -bpm         # play track + BPM overlay
+```
+
+`run_phone.sh` reads `APPLE_TEAM_ID`, `IPHONE_UDID`, and `IPHONE_BUILD_ID`
+from `~/appledev/setupenv.sh` to handle code-signing automatically.
+
 ## How It Works
 
 1. **Audio Capture**: AVAudioEngine taps the microphone input (with AGC) or plays music via AVAudioPlayerNode
